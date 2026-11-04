@@ -21,7 +21,7 @@ class InvoiceRepository:
 
     @contextmanager
     def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """Provide a connection with busy timeout and Row factory."""
+        """Provide a connection with strict durability, foreign keys, and busy timeout."""
         conn = sqlite3.connect(
             self.db_path,
             timeout=30.0,
@@ -29,6 +29,10 @@ class InvoiceRepository:
             isolation_level=None,  # Enable explicit transaction control (BEGIN IMMEDIATE)
         )
         conn.row_factory = sqlite3.Row
+        # Connection-level pragmas: enforced per connection
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
+        conn.execute("PRAGMA synchronous = FULL;")
         try:
             yield conn
         finally:
@@ -39,10 +43,10 @@ class InvoiceRepository:
         return datetime.now(timezone.utc).isoformat()
 
     def _init_db(self) -> None:
-        """Create necessary schema tables and indexes if they do not exist."""
+        """Create necessary schema tables and indexes with database-level integrity constraints."""
         with self._get_connection() as conn:
-            conn.execute("PRAGMA foreign_keys = ON;")
-            conn.execute("PRAGMA journal_mode = WAL;")
+            if self.db_path != ":memory:":
+                conn.execute("PRAGMA journal_mode = WAL;")
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS invoice_sequences (
@@ -60,18 +64,19 @@ class InvoiceRepository:
                     store_code TEXT NOT NULL,
                     financial_year TEXT NOT NULL,
                     seq INTEGER NOT NULL,
-                    status TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('POSTED', 'PENDING_RECONCILIATION', 'CANCELLED')),
                     customer_id INTEGER,
-                    gross_paise INTEGER NOT NULL,
-                    discount_paise INTEGER NOT NULL,
-                    net_paise INTEGER NOT NULL,
-                    taxable_paise INTEGER NOT NULL,
-                    tax_paise INTEGER NOT NULL,
+                    gross_paise INTEGER NOT NULL CHECK (gross_paise >= 0),
+                    discount_paise INTEGER NOT NULL CHECK (discount_paise >= 0),
+                    net_paise INTEGER NOT NULL CHECK (net_paise >= 0),
+                    taxable_paise INTEGER NOT NULL CHECK (taxable_paise >= 0),
+                    tax_paise INTEGER NOT NULL CHECK (tax_paise >= 0),
                     checkout_ref TEXT UNIQUE NOT NULL,
-                    terminal_charge_id TEXT,
+                    terminal_charge_id TEXT UNIQUE,
                     shopify_order_id INTEGER,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (store_code, financial_year, seq)
                 );
             """)
 
@@ -84,17 +89,17 @@ class InvoiceRepository:
                     variant_id INTEGER NOT NULL,
                     sku TEXT NOT NULL,
                     title TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    unit_price_paise INTEGER NOT NULL,
-                    gross_paise INTEGER NOT NULL,
-                    discount_paise INTEGER NOT NULL,
-                    net_paise INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL CHECK (quantity > 0),
+                    unit_price_paise INTEGER NOT NULL CHECK (unit_price_paise >= 0),
+                    gross_paise INTEGER NOT NULL CHECK (gross_paise >= 0),
+                    discount_paise INTEGER NOT NULL CHECK (discount_paise >= 0),
+                    net_paise INTEGER NOT NULL CHECK (net_paise >= 0),
                     hsn TEXT NOT NULL,
                     pair_ref TEXT,
                     rx_id TEXT,
                     lens_config TEXT,
                     properties_json TEXT,
-                    FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no)
+                    FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
                 );
             """)
 
@@ -104,13 +109,14 @@ class InvoiceRepository:
                     checkout_ref TEXT NOT NULL,
                     invoice_no TEXT NOT NULL,
                     order_ref TEXT UNIQUE NOT NULL,
-                    amount_paise INTEGER NOT NULL,
+                    amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
                     method TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    charge_id TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('INITIATED', 'CAPTURED', 'FAILED', 'UNKNOWN')),
+                    charge_id TEXT UNIQUE,
                     error_message TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
                 );
             """)
 
@@ -120,11 +126,12 @@ class InvoiceRepository:
                     invoice_no TEXT UNIQUE NOT NULL,
                     checkout_ref TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('PENDING', 'COMPLETED', 'AMBIGUOUS', 'RECONCILED')),
                     shopify_order_id INTEGER,
                     error_message TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
                 );
             """)
 

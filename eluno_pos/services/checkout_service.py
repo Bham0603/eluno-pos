@@ -233,7 +233,6 @@ class CheckoutService:
             channel=session.channel,
             staff_id=session.staff_id,
             transaction_date=session.transaction_date,
-            prescription_map=session.prescription_map,
         )
 
         # Step 3: Create Shopify order

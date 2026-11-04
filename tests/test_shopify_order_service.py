@@ -119,7 +119,6 @@ class TestShopifyOrderService(unittest.TestCase):
             channel="whatsapp_booked",
             staff_id="S105",
             transaction_date=date(2026, 10, 2),
-            prescription_map={"RX5007": {"od": {"sph": -3.25}, "os": {"sph": -3.5}, "pd": 60}},
         )
 
         self.assertEqual(payload["location_id"], 90001)
@@ -156,7 +155,143 @@ class TestShopifyOrderService(unittest.TestCase):
         self.assertEqual(lens_props["line_type"], "lens")
         self.assertEqual(lens_props["rx_id"], "RX5007")
         self.assertIn("lens_config", lens_props)
-        self.assertIn("rx", lens_props)
+        # Data minimization verification: "rx" object must NOT be in properties
+        self.assertNotIn("rx", lens_props)
+
+    def test_prescription_data_minimization_shopify_payload(self) -> None:
+        """Verify that Shopify line-item properties never leak clinical prescription data."""
+        payload = self.service.build_order_payload(
+            cart=self.cart,
+            invoice=self.invoice,
+            payment=self.payment,
+            applied_offers=[],
+            location_id=90001,
+            store_code="HSR",
+            transaction_date=date(2026, 10, 2),
+        )
+
+        for item in payload["line_items"]:
+            prop_names = {p["name"] for p in item.get("properties", [])}
+            # "rx" must never be sent to Shopify
+            self.assertNotIn("rx", prop_names)
+
+            # Neither OD, OS, SPH, CYL, AXIS, ADD, PD should exist as properties
+            clinical_terms = {"od", "os", "sph", "cyl", "axis", "add", "pd"}
+            for prop in item.get("properties", []):
+                self.assertNotIn(prop["name"].lower(), clinical_terms)
+                for term in clinical_terms:
+                    self.assertNotIn(f'"{term}"', prop["value"].lower())
+
+            # Only rx_id is allowed as a foreign reference
+            if any(p["name"] == "line_type" and p["value"] == "lens" for p in item.get("properties", [])):
+                self.assertIn("rx_id", prop_names)
+
+    def test_exact_gst_paisa_reconciliation_at_5_percent(self) -> None:
+        """Regression test: verify exact paisa reconciliation for ₹9,499.00 lens with ₹1,000.00 discount at 5% GST.
+
+        Gross: ₹9,499.00 (949900 paise)
+        Discount: ₹1,000.00 (100000 paise)
+        Net Inclusive: ₹8,499.00 (849900 paise)
+        Taxable: ₹8,094.29 (809429 paise)
+        CGST: ₹202.36 (20236 paise, rate 0.025)
+        SGST: ₹202.35 (20235 paise, rate 0.025)
+        Total GST: ₹404.71 (40471 paise)
+        Invariant: Taxable + CGST + SGST == Net Inclusive (8094.29 + 202.36 + 202.35 == 8499.00)
+        """
+        discounted_lens = CartLine(
+            line_id="L_PGX",
+            line_type="lens",
+            variant_id=91000083,
+            sku="LN-0043",
+            title="Progressive 1.60 Blue Cut",
+            unit_price_paise=949900,
+            hsn="90015000",
+            pair_ref="1",
+            lens_type="progressive",
+            index=1.6,
+            coating="blue_cut",
+            rx_id="RX5007",
+            discount_allocations=[
+                DiscountAllocation(offer_id="FREE_BLUECUT_PGX", offer_name="Free Bluecut", amount_paise=100000)
+            ],
+        )
+
+        test_cart = Cart(lines=[discounted_lens], customer=self.customer)
+        self.assertEqual(test_cart.net_total_paise, 849900)
+
+        inv = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_gst_audit_5pct",
+            customer_id=self.customer.id,
+            gross_paise=949900,
+            discount_paise=100000,
+            net_paise=849900,
+            taxable_paise=809429,
+            tax_paise=40471,
+            lines=[],
+        )
+
+        pay = PaymentRecord(
+            checkout_ref=inv.checkout_ref,
+            invoice_no=inv.invoice_no,
+            order_ref="pay_gst_audit",
+            amount_paise=849900,
+            method="upi",
+            status=PaymentStatus.CAPTURED,
+            charge_id="chg_gst_audit",
+        )
+
+        applied = [
+            AppliedOffer(
+                offer_id="FREE_BLUECUT_PGX",
+                name="Free Bluecut",
+                discount_paise=100000,
+                line_allocations={"L_PGX": 100000},
+                description="₹1000 off",
+            )
+        ]
+
+        payload = self.service.build_order_payload(
+            cart=test_cart,
+            invoice=inv,
+            payment=pay,
+            applied_offers=applied,
+            location_id=90001,
+            store_code="HSR",
+            transaction_date=date(2026, 10, 20),
+        )
+
+        line_item = payload["line_items"][0]
+        self.assertEqual(line_item["price"], "9499.00")
+        self.assertEqual(line_item["total_discount"], "1000.00")
+
+        tax_lines = {t["title"]: t for t in line_item["tax_lines"]}
+        self.assertIn("CGST", tax_lines)
+        self.assertIn("SGST", tax_lines)
+
+        cgst = tax_lines["CGST"]
+        sgst = tax_lines["SGST"]
+
+        self.assertEqual(cgst["rate"], 0.025)
+        self.assertEqual(sgst["rate"], 0.025)
+
+        # EXACT PAISA RECONCILIATION:
+        # CGST receives the odd paisa, SGST receives the remainder
+        self.assertEqual(cgst["price"], "202.36")
+        self.assertEqual(sgst["price"], "202.35")
+
+        # Sum of tax components
+        cgst_paise = round(float(cgst["price"]) * 100)
+        sgst_paise = round(float(sgst["price"]) * 100)
+        self.assertEqual(cgst_paise, 20236)
+        self.assertEqual(sgst_paise, 20235)
+        self.assertEqual(cgst_paise + sgst_paise, 40471)
+
+        # Full line reconciliation
+        taxable_paise = 849900 - (cgst_paise + sgst_paise)
+        self.assertEqual(taxable_paise, 809429)
+        self.assertEqual(taxable_paise + cgst_paise + sgst_paise, 849900)
 
     def test_create_order_success_updates_invoice_to_posted(self) -> None:
         payload = {"line_items": []}

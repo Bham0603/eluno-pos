@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from eluno_pos.domain.invoice import InvoiceLine, InvoiceStatus
+from eluno_pos.domain.invoice import Invoice, InvoiceLine, InvoiceStatus
 from eluno_pos.domain.payment import PaymentRecord, PaymentStatus
 from eluno_pos.repositories.invoice_repository import InvoiceRepository
 
@@ -188,7 +188,7 @@ class TestInvoiceRepository(unittest.TestCase):
     def test_payment_attempt_audit_lifecycle(self) -> None:
         attempt = PaymentRecord(
             checkout_ref="chk_pay_test",
-            invoice_no="ELU/HSR/FY26/00005",
+            invoice_no=self._sample_invoice().invoice_no,
             order_ref="ord_ref_test_001",
             amount_paise=1299900,
             method="upi",
@@ -208,6 +208,136 @@ class TestInvoiceRepository(unittest.TestCase):
         self.assertIsNotNone(updated)
         self.assertEqual(updated.status, PaymentStatus.CAPTURED)
         self.assertEqual(updated.charge_id, "chg_test_12345")
+
+    def _sample_invoice(self, store: str = "HSR", ref: str = "chk_sample") -> Invoice:
+        return self.repo.allocate_invoice(
+            store_code=store,
+            financial_year="FY26",
+            checkout_ref=ref,
+            customer_id=80001001,
+            gross_paise=500000,
+            discount_paise=0,
+            net_paise=500000,
+            taxable_paise=423729,
+            tax_paise=76271,
+            lines=[self._sample_line()],
+        )
+
+    def test_database_pragmas_and_durability_configuration(self) -> None:
+        """Verify that foreign keys, busy timeout, WAL mode, and synchronous FULL are enforced."""
+        with self.repo._get_connection() as conn:
+            fk = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+            self.assertEqual(fk, 1, "Foreign keys must be enabled on every connection")
+
+            sync = conn.execute("PRAGMA synchronous;").fetchone()[0]
+            self.assertEqual(sync, 2, "PRAGMA synchronous must be 2 (FULL) to guarantee power-loss durability")
+
+            timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+            self.assertGreaterEqual(timeout, 30000, "Busy timeout must be at least 30,000ms")
+
+            journal = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+            self.assertEqual(journal.lower(), "wal", "File DB must operate in WAL journal mode")
+
+    def test_invoice_table_check_constraint_status(self) -> None:
+        """Verify CHECK constraint rejects invalid invoice status."""
+        import sqlite3
+        with self.repo._get_connection() as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO invoices (
+                        invoice_no, store_code, financial_year, seq, status,
+                        customer_id, gross_paise, discount_paise, net_paise,
+                        taxable_paise, tax_paise, checkout_ref, terminal_charge_id,
+                        shopify_order_id, created_at, updated_at
+                    ) VALUES ('ELU/HSR/FY26/99999', 'HSR', 'FY26', 99999, 'INVALID_STATUS',
+                             80001001, 1000, 0, 1000, 900, 100, 'chk_invalid_status',
+                             NULL, NULL, '2026-10-20', '2026-10-20');
+                    """
+                )
+
+    def test_invoice_table_unique_sequence_constraint(self) -> None:
+        """Verify UNIQUE (store_code, financial_year, seq) constraint."""
+        import sqlite3
+        inv = self._sample_invoice(store="HSR", ref="chk_uniq_seq")
+        with self.repo._get_connection() as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO invoices (
+                        invoice_no, store_code, financial_year, seq, status,
+                        customer_id, gross_paise, discount_paise, net_paise,
+                        taxable_paise, tax_paise, checkout_ref, terminal_charge_id,
+                        shopify_order_id, created_at, updated_at
+                    ) VALUES ('ELU/HSR/FY26/00001_DUP', 'HSR', 'FY26', ?, 'POSTED',
+                             80001001, 1000, 0, 1000, 900, 100, 'chk_dup_seq',
+                             NULL, NULL, '2026-10-20', '2026-10-20');
+                    """,
+                    (inv.seq,),
+                )
+
+    def test_payment_attempt_foreign_key_constraint(self) -> None:
+        """Verify foreign key constraint on payment_attempts referencing invoices."""
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            attempt = PaymentRecord(
+                checkout_ref="chk_non_existent",
+                invoice_no="ELU/NONEXISTENT/FY26/00001",
+                order_ref="ord_fk_violation",
+                amount_paise=1000,
+                method="upi",
+                status=PaymentStatus.INITIATED,
+            )
+            self.repo.record_payment_attempt(attempt)
+
+    def test_payment_attempt_charge_id_uniqueness(self) -> None:
+        """Verify that a charge_id cannot be linked to multiple payment attempts."""
+        import sqlite3
+        inv1 = self._sample_invoice(store="HSR", ref="chk_chg_uniq_1")
+        inv2 = self._sample_invoice(store="HSR", ref="chk_chg_uniq_2")
+
+        att1 = PaymentRecord(
+            checkout_ref=inv1.checkout_ref,
+            invoice_no=inv1.invoice_no,
+            order_ref="ord_chg_1",
+            amount_paise=1000,
+            method="upi",
+            status=PaymentStatus.CAPTURED,
+            charge_id="chg_shared_duplicate",
+        )
+        self.repo.record_payment_attempt(att1)
+
+        att2 = PaymentRecord(
+            checkout_ref=inv2.checkout_ref,
+            invoice_no=inv2.invoice_no,
+            order_ref="ord_chg_2",
+            amount_paise=1000,
+            method="upi",
+            status=PaymentStatus.CAPTURED,
+            charge_id="chg_shared_duplicate",
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repo.record_payment_attempt(att2)
+
+    def test_invoice_terminal_charge_id_uniqueness(self) -> None:
+        """Verify that no two invoices can claim the same terminal_charge_id."""
+        import sqlite3
+        inv1 = self._sample_invoice(store="HSR", ref="chk_inv_chg_1")
+        inv2 = self._sample_invoice(store="HSR", ref="chk_inv_chg_2")
+
+        self.repo.update_invoice_payment(inv1.invoice_no, "chg_unique_term_001")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repo.update_invoice_payment(inv2.invoice_no, "chg_unique_term_001")
+
+    def test_shopify_intent_foreign_key_constraint(self) -> None:
+        """Verify foreign key constraint on shopify_order_intents referencing invoices."""
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repo.record_shopify_intent(
+                invoice_no="ELU/NONEXISTENT/FY26/00099",
+                checkout_ref="chk_non_existent_shopify",
+                payload={"order": {}},
+            )
 
 
 if __name__ == "__main__":

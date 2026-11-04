@@ -42,11 +42,14 @@ class ShopifyOrderService:
         channel: str = "walk_in",
         staff_id: Optional[str] = None,
         transaction_date: Optional[date] = None,
-        prescription_map: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Construct a valid Shopify Admin Order payload from cart, invoice, and payment."""
+        """Construct a valid Shopify Admin Order payload from cart, invoice, and payment.
+
+        DATA MINIMIZATION RULE:
+        Only rx_id is sent to Shopify as an external reference. Full clinical prescription
+        data (OD, OS, SPH, CYL, AXIS, ADD, PD) is NEVER sent to Shopify.
+        """
         tx_date = transaction_date or date.today()
-        prescription_map = prescription_map or {}
 
         # 1. Discount applications
         discount_applications = []
@@ -66,12 +69,22 @@ class ShopifyOrderService:
         # 2. Line items with tax lines, properties, and discount allocations
         line_items = []
         for line in cart.lines:
-            # Calculate line tax
+            # Calculate line tax from Phase 3 GstService
             line_tax = self.gst_service.calculate_line_tax(
                 hsn=line.hsn,
                 net_inclusive_paise=line.net_price_paise,
                 transaction_date=tx_date,
             )
+
+            # Reconcile exact paisa: taxable + CGST + SGST == net_price_paise
+            if not line_tax.is_reconciled:
+                raise ValueError(
+                    f"GST reconciliation failed for line {line.line_id}: "
+                    f"taxable({line_tax.taxable_value_paise}) + "
+                    f"cgst({line_tax.cgst_paise}) + "
+                    f"sgst({line_tax.sgst_paise}) != "
+                    f"net({line.net_price_paise})"
+                )
 
             # Build tax lines
             half_rate = (line_tax.rate_bps / 2) / 10000.0
@@ -80,7 +93,7 @@ class ShopifyOrderService:
                 {"title": "SGST", "rate": half_rate, "price": f"{line_tax.sgst_paise / 100:.2f}"},
             ]
 
-            # Build line properties
+            # Build line properties (data-minimized)
             props: List[Dict[str, str]] = [
                 {"name": "line_type", "value": line.line_type},
                 {"name": "hsn", "value": line.hsn},
@@ -92,12 +105,8 @@ class ShopifyOrderService:
                 config_str = f"{line.lens_type or 'single_vision'}/{line.index or 1.5}/{line.coating or 'standard'}"
                 props.append({"name": "lens_config", "value": config_str})
                 if line.rx_id:
+                    # Data minimization: send only rx_id, never clinical optical values
                     props.append({"name": "rx_id", "value": line.rx_id})
-                    if line.rx_id in prescription_map:
-                        rx_val = prescription_map[line.rx_id]
-                        if not isinstance(rx_val, str):
-                            rx_val = json.dumps(rx_val)
-                        props.append({"name": "rx", "value": rx_val})
 
             if line.for_customer_id:
                 props.append({"name": "for_customer_id", "value": str(line.for_customer_id)})

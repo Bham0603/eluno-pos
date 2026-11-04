@@ -250,7 +250,6 @@ class TestMockServerIntegration(unittest.TestCase):
             staff_id="S105",
             transaction_date=date(2026, 10, 20),
             offer_strategy=OfferConflictStrategy.MAX_SAVINGS,
-            prescription_map={rx.rx_id: rx.raw_data},
         )
         self.assertEqual(session.invoice.invoice_no, "ELU/HSR/FY26/00001")
         self.assertEqual(session.invoice.status, InvoiceStatus.PENDING_RECONCILIATION)
@@ -282,6 +281,14 @@ class TestMockServerIntegration(unittest.TestCase):
         self.assertEqual(len(txs), 1)
         self.assertEqual(txs[0]["kind"], "sale")
         self.assertEqual(txs[0]["status"], "success")
+
+        # Verify prescription data minimization on Shopify order
+        lens_item = next(li for li in created_order["line_items"] if any(p["name"] == "line_type" and p["value"] == "lens" for p in li.get("properties", [])))
+        props = {p["name"]: p["value"] for p in lens_item.get("properties", [])}
+        self.assertEqual(props.get("rx_id"), "RX5007")
+        self.assertNotIn("rx", props, "Shopify line item must not carry full serialized prescription")
+        for term in ("od", "os", "sph", "cyl", "axis", "add", "pd"):
+            self.assertNotIn(term, props)
 
         temp_dir.cleanup()
 
