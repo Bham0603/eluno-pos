@@ -34,6 +34,10 @@ class InvoiceLine:
     discount_paise: int
     net_paise: int
     hsn: str
+    taxable_paise: int = 0
+    cgst_paise: int = 0
+    sgst_paise: int = 0
+    tax_paise: int = 0
     pair_ref: Optional[str] = None
     rx_id: Optional[str] = None
     lens_config: Optional[str] = None

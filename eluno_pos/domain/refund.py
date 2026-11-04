@@ -43,7 +43,6 @@ class RefundLine:
 class RefundRecord:
     """Durable audit record of a store refund transaction."""
     refund_id: str
-    credit_note_no: str
     invoice_no: str
     checkout_ref: str
     charge_id: str
@@ -51,6 +50,7 @@ class RefundRecord:
     amount_paise: int
     status: RefundStatus
     reason_code: str
+    credit_note_no: Optional[str] = None
     staff_id: Optional[str] = None
     terminal_refund_id: Optional[str] = None
     shopify_refund_id: Optional[int] = None
@@ -65,10 +65,10 @@ class RefundResult:
     """Final outcome of an orchestrated refund workflow."""
     success: bool
     refund_id: str
-    credit_note_no: str
     invoice_no: str
     status: RefundStatus
     amount_refunded_paise: int
+    credit_note_no: Optional[str] = None
     terminal_refund_id: Optional[str] = None
     shopify_refund_id: Optional[int] = None
     frames_restocked_count: int = 0
@@ -78,3 +78,4 @@ class RefundResult:
     def is_pending_reconciliation(self) -> bool:
         """Whether the refund requires manual or background reconciliation."""
         return self.status == RefundStatus.PENDING_RECONCILIATION
+

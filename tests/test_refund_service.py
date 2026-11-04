@@ -1,8 +1,11 @@
-"""Tests for RefundService duplicate prevention, terminal reversal, and frame restocking."""
+"""Tests for RefundService concurrency safety, credit note lifecycle, and frame restocking."""
 
+import concurrent.futures
 from datetime import date
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -10,7 +13,7 @@ from eluno_pos.adapters.exceptions import AmbiguousOperationError, ValidationErr
 from eluno_pos.adapters.shopify_client import ShopifyClient
 from eluno_pos.adapters.terminal_client import TerminalClient
 from eluno_pos.domain.invoice import Invoice, InvoiceLine, InvoiceStatus
-from eluno_pos.domain.refund import RefundStatus
+from eluno_pos.domain.refund import RefundRecord, RefundStatus
 from eluno_pos.repositories.invoice_repository import InvoiceRepository
 from eluno_pos.services.refund_service import RefundService
 
@@ -41,6 +44,10 @@ class TestRefundService(unittest.TestCase):
             gross_paise=1099800,
             discount_paise=0,
             net_paise=1099800,
+            taxable_paise=932034,
+            cgst_paise=83883,
+            sgst_paise=83883,
+            tax_paise=167766,
             hsn="90031900",
             pair_ref="1",
         )
@@ -55,6 +62,10 @@ class TestRefundService(unittest.TestCase):
             gross_paise=949900,
             discount_paise=100000,
             net_paise=849900,
+            taxable_paise=809429,
+            cgst_paise=20236,
+            sgst_paise=20235,
+            tax_paise=40471,
             hsn="90015000",
             pair_ref="1",
             rx_id="RX5007",
@@ -161,6 +172,156 @@ class TestRefundService(unittest.TestCase):
         self.assertEqual(frame_entry["location_id"], 70000002)
         self.assertEqual(lens_entry["restock_type"], "no_restock")
         self.assertNotIn("location_id", lens_entry)
+
+    def test_concurrent_refund_attempts_atomic_safety(self) -> None:
+        """Requirement 1: Start two refund attempts simultaneously.
+
+        Exactly one attempt may initiate a terminal refund.
+        The other attempt must be rejected safely.
+        Verify only one terminal refund was created.
+        """
+        self.mock_terminal_client.get_charge.return_value = {
+            "charge_id": "chg_unit_refund_01",
+            "amount_paise": 1949700,
+            "refunded_paise": 0,
+            "status": "captured",
+        }
+        self.mock_terminal_client.create_refund.return_value = {
+            "refund_id": "trf_concurrent_01",
+            "charge_id": "chg_unit_refund_01",
+            "amount_paise": 1949700,
+            "status": "processed",
+        }
+        self.mock_shopify_client.create_refund.return_value = {"id": 98000099}
+
+        results = []
+        errors = []
+
+        barrier = threading.Barrier(2)
+
+        def attempt_refund():
+            barrier.wait()
+            try:
+                res = self.service.process_full_refund(
+                    invoice_no=self.invoice.invoice_no,
+                    location_id=70000002,
+                )
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=attempt_refund)
+        t2 = threading.Thread(target=attempt_refund)
+
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Exactly one thread succeeds in initiating and capturing the refund
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+
+        # The second thread was rejected safely via database-level concurrency protection
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(
+            isinstance(errors[0], (AmbiguousOperationError, ValidationError)),
+            f"Expected concurrency safety error, got {type(errors[0])}",
+        )
+
+        # Invariant: Terminal create_refund was invoked EXACTLY ONCE
+        self.assertEqual(self.mock_terminal_client.create_refund.call_count, 1)
+
+    def test_terminal_refund_failure_does_not_issue_credit_note(self) -> None:
+        """Requirement 2: Terminal refund failure without credit note issuance."""
+        self.mock_terminal_client.get_charge.return_value = {
+            "charge_id": "chg_unit_refund_01",
+            "amount_paise": 1949700,
+            "refunded_paise": 0,
+            "status": "captured",
+        }
+        # Simulate gateway rejection
+        self.mock_terminal_client.create_refund.side_effect = ValidationError("Gateway: Customer card expired or declined")
+
+        with self.assertRaises(ValidationError):
+            self.service.process_full_refund(
+                invoice_no=self.invoice.invoice_no,
+                location_id=70000002,
+            )
+
+        # Invariant: Zero credit note sequences consumed!
+        with self.repo._get_connection() as conn:
+            cur = conn.execute("SELECT count(*) as cnt FROM credit_note_sequences WHERE store_code = 'HSR';")
+            self.assertEqual(cur.fetchone()["cnt"], 0)
+
+        # Invariant: Refund record in DB is FAILED with no credit note assigned
+        refunds = self.repo.get_refunds_for_invoice(self.invoice.invoice_no)
+        self.assertEqual(len(refunds), 1)
+        self.assertEqual(refunds[0].status, RefundStatus.FAILED)
+        self.assertIsNone(refunds[0].credit_note_no)
+
+    def test_application_restart_between_terminal_confirmation_and_credit_note_allocation(self) -> None:
+        """Requirement 2: Recovery if app crashes after terminal confirmation before credit note allocation."""
+        # 1. Simulate DB record created before crash: terminal refund captured, credit note not yet allocated
+        ref_id = "ref_crash_test_01"
+        self.repo.create_refund_intent_atomically(
+            invoice_no=self.invoice.invoice_no,
+            refund_id=ref_id,
+            amount_paise=1949700,
+            reason_code="CUSTOMER_RETURN",
+        )
+        self.repo.update_refund_terminal_captured(ref_id, "trf_captured_before_crash")
+
+        # 2. Simulate application restart with fresh instances
+        restarted_repo = InvoiceRepository(self.db_path)
+        restarted_service = RefundService(
+            terminal_client=self.mock_terminal_client,
+            shopify_client=self.mock_shopify_client,
+            invoice_repository=restarted_repo,
+        )
+        self.mock_shopify_client.create_refund.return_value = {"id": 98000555}
+
+        # 3. Resume / recover refund
+        rec_res = restarted_service.resume_or_reconcile_refund(
+            refund_id=ref_id,
+            location_id=70000002,
+            financial_year="FY26",
+        )
+
+        self.assertIsNotNone(rec_res)
+        self.assertTrue(rec_res.success)
+        self.assertEqual(rec_res.status, RefundStatus.COMPLETED)
+        # Credit note was allocated upon recovery
+        self.assertEqual(rec_res.credit_note_no, "ELU/HSR/FY26/CN/00001")
+        self.assertEqual(rec_res.shopify_refund_id, 98000555)
+
+    def test_no_duplicate_credit_note_after_recovery(self) -> None:
+        """Requirement 2: Preserve already allocated credit note numbers without duplicate issuance."""
+        # 1. Simulate refund where credit note was allocated before Shopify network timeout
+        ref_id = "ref_dup_cn_check"
+        self.repo.create_refund_intent_atomically(
+            invoice_no=self.invoice.invoice_no,
+            refund_id=ref_id,
+            amount_paise=1949700,
+            reason_code="CUSTOMER_RETURN",
+        )
+        self.repo.update_refund_terminal_captured(ref_id, "trf_cn_dup_01")
+        cn_first = self.repo.allocate_and_persist_credit_note(ref_id, "HSR", "FY26")
+        self.assertEqual(cn_first, "ELU/HSR/FY26/CN/00001")
+
+        # 2. Re-running allocate_and_persist_credit_note on the same refund ID MUST return the same CN
+        cn_second = self.repo.allocate_and_persist_credit_note(ref_id, "HSR", "FY26")
+        self.assertEqual(cn_first, cn_second)
+
+        # 3. Resume refund
+        self.mock_shopify_client.create_refund.return_value = {"id": 98000777}
+        rec_res = self.service.resume_or_reconcile_refund(ref_id, location_id=70000002)
+        self.assertTrue(rec_res.success)
+        self.assertEqual(rec_res.credit_note_no, "ELU/HSR/FY26/CN/00001")
+
+        # 4. Verify sequence was only incremented once (next is 00002, not 00003)
+        next_cn = self.repo.allocate_credit_note_no("HSR", "FY26")
+        self.assertEqual(next_cn, "ELU/HSR/FY26/CN/00002")
 
     def test_already_fully_refunded_charge_is_rejected(self) -> None:
         self.mock_terminal_client.get_charge.return_value = {

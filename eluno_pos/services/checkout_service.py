@@ -115,10 +115,16 @@ class CheckoutService:
         # 3. Build snapshot invoice lines
         checkout_ref = f"chk_{uuid.uuid4().hex[:12]}"
         inv_lines: List[InvoiceLine] = []
-        for line in cart.lines:
+        for i, line in enumerate(cart.lines):
             lens_cfg = None
             if line.line_type == "lens":
                 lens_cfg = f"{line.lens_type or 'single_vision'}/{line.index or 1.5}/{line.coating or 'standard'}"
+
+            lt = tax_summary.line_taxes[i] if i < len(tax_summary.line_taxes) else None
+            taxable_paise = lt.taxable_value_paise if lt else 0
+            cgst_paise = lt.cgst_paise if lt else 0
+            sgst_paise = lt.sgst_paise if lt else 0
+            tax_paise = lt.total_gst_paise if lt else 0
 
             inv_lines.append(
                 InvoiceLine(
@@ -133,6 +139,10 @@ class CheckoutService:
                     discount_paise=line.total_discount_paise,
                     net_paise=line.net_price_paise,
                     hsn=line.hsn,
+                    taxable_paise=taxable_paise,
+                    cgst_paise=cgst_paise,
+                    sgst_paise=sgst_paise,
+                    tax_paise=tax_paise,
                     pair_ref=line.pair_ref,
                     rx_id=line.rx_id,
                     lens_config=lens_cfg,

@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from typing import Any, Dict, Generator, List, Optional
 
+from eluno_pos.adapters.exceptions import AmbiguousOperationError, ValidationError
 from eluno_pos.domain.invoice import Invoice, InvoiceLine, InvoiceStatus
 from eluno_pos.domain.payment import PaymentRecord, PaymentStatus
 from eluno_pos.domain.refund import RefundRecord, RefundStatus
@@ -95,6 +96,10 @@ class InvoiceRepository:
                     gross_paise INTEGER NOT NULL CHECK (gross_paise >= 0),
                     discount_paise INTEGER NOT NULL CHECK (discount_paise >= 0),
                     net_paise INTEGER NOT NULL CHECK (net_paise >= 0),
+                    taxable_paise INTEGER NOT NULL DEFAULT 0,
+                    cgst_paise INTEGER NOT NULL DEFAULT 0,
+                    sgst_paise INTEGER NOT NULL DEFAULT 0,
+                    tax_paise INTEGER NOT NULL DEFAULT 0,
                     hsn TEXT NOT NULL,
                     pair_ref TEXT,
                     rx_id TEXT,
@@ -149,7 +154,7 @@ class InvoiceRepository:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS refunds (
                     refund_id TEXT PRIMARY KEY,
-                    credit_note_no TEXT UNIQUE NOT NULL,
+                    credit_note_no TEXT UNIQUE,
                     invoice_no TEXT NOT NULL,
                     checkout_ref TEXT NOT NULL,
                     charge_id TEXT NOT NULL,
@@ -266,8 +271,9 @@ class InvoiceRepository:
                             INSERT INTO invoice_lines (
                                 invoice_no, line_id, line_type, variant_id, sku, title,
                                 quantity, unit_price_paise, gross_paise, discount_paise,
-                                net_paise, hsn, pair_ref, rx_id, lens_config, properties_json
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                net_paise, taxable_paise, cgst_paise, sgst_paise, tax_paise,
+                                hsn, pair_ref, rx_id, lens_config, properties_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                             """,
                             (
                                 invoice_no,
@@ -281,6 +287,10 @@ class InvoiceRepository:
                                 line.gross_paise,
                                 line.discount_paise,
                                 line.net_paise,
+                                line.taxable_paise,
+                                line.cgst_paise,
+                                line.sgst_paise,
+                                line.tax_paise,
                                 line.hsn,
                                 line.pair_ref,
                                 line.rx_id,
@@ -341,6 +351,7 @@ class InvoiceRepository:
         lines = []
         for l in lines_cur.fetchall():
             props = json.loads(l["properties_json"]) if l["properties_json"] else []
+            col_keys = l.keys() if hasattr(l, "keys") else []
             lines.append(
                 InvoiceLine(
                     line_id=l["line_id"],
@@ -353,6 +364,10 @@ class InvoiceRepository:
                     gross_paise=l["gross_paise"],
                     discount_paise=l["discount_paise"],
                     net_paise=l["net_paise"],
+                    taxable_paise=l["taxable_paise"] if "taxable_paise" in col_keys else 0,
+                    cgst_paise=l["cgst_paise"] if "cgst_paise" in col_keys else 0,
+                    sgst_paise=l["sgst_paise"] if "sgst_paise" in col_keys else 0,
+                    tax_paise=l["tax_paise"] if "tax_paise" in col_keys else 0,
                     hsn=l["hsn"],
                     pair_ref=l["pair_ref"],
                     rx_id=l["rx_id"],
@@ -592,6 +607,166 @@ class InvoiceRepository:
                 )
             return [self._build_invoice_from_row(conn, row) for row in cur.fetchall()]
 
+    def create_refund_intent_atomically(
+        self,
+        invoice_no: str,
+        refund_id: str,
+        amount_paise: int,
+        reason_code: str,
+        staff_id: Optional[str] = None,
+    ) -> RefundRecord:
+        """Atomically validate invoice state, check active/pending/completed refunds, and persist new refund intent.
+
+        Uses BEGIN IMMEDIATE transaction to guarantee atomic serialization.
+        Ensures concurrent requests cannot both pass the check and initiate terminal refund POST requests.
+        """
+        now = self._now_iso()
+        with self._lock:
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    # 1. Inspect invoice
+                    cur = conn.execute("SELECT * FROM invoices WHERE invoice_no = ?;", (invoice_no,))
+                    inv_row = cur.fetchone()
+                    if not inv_row:
+                        raise ValidationError(message=f"Invoice {invoice_no} not found")
+
+                    if inv_row["status"] != InvoiceStatus.POSTED.value:
+                        raise ValidationError(
+                            message=f"Cannot refund invoice {invoice_no} in status {inv_row['status']}. Only POSTED invoices can be refunded."
+                        )
+
+                    if not inv_row["terminal_charge_id"]:
+                        raise ValidationError(message=f"Invoice {invoice_no} has no captured terminal charge ID")
+
+                    if not inv_row["shopify_order_id"]:
+                        raise ValidationError(message=f"Invoice {invoice_no} has no linked Shopify order ID")
+
+                    # 2. Check existing refunds for this invoice and charge_id
+                    cur = conn.execute(
+                        "SELECT * FROM refunds WHERE invoice_no = ? OR charge_id = ?;",
+                        (invoice_no, inv_row["terminal_charge_id"]),
+                    )
+                    existing_rows = cur.fetchall()
+
+                    # Block if any unresolved in-flight refund exists
+                    for r in existing_rows:
+                        if r["status"] in (
+                            RefundStatus.INITIATED.value,
+                            RefundStatus.TERMINAL_REFUNDED.value,
+                            RefundStatus.PENDING_RECONCILIATION.value,
+                        ):
+                            raise AmbiguousOperationError(
+                                message=(
+                                    f"Invoice {invoice_no} has an active or unresolved refund intent ({r['refund_id']}) "
+                                    f"in status {r['status']}. Resolve pending reconciliation before initiating another refund attempt."
+                                )
+                            )
+
+                    # Check completed refunds
+                    total_completed = sum(
+                        r["amount_paise"] for r in existing_rows if r["status"] == RefundStatus.COMPLETED.value
+                    )
+                    remaining = inv_row["net_paise"] - total_completed
+                    if remaining <= 0 or amount_paise > remaining:
+                        raise ValidationError(
+                            message=(
+                                f"Invoice {invoice_no} has already been fully refunded or requested amount "
+                                f"({amount_paise} paise) exceeds remaining refundable amount ({remaining} paise)."
+                            )
+                        )
+
+                    # 3. Insert new refund intent with credit_note_no = NULL
+                    conn.execute(
+                        """
+                        INSERT INTO refunds (
+                            refund_id, credit_note_no, invoice_no, checkout_ref,
+                            charge_id, shopify_order_id, amount_paise, status,
+                            reason_code, staff_id, terminal_refund_id, shopify_refund_id,
+                            baseline_refunded_paise, error_message, created_at, updated_at
+                        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, ?, ?);
+                        """,
+                        (
+                            refund_id,
+                            invoice_no,
+                            inv_row["checkout_ref"],
+                            inv_row["terminal_charge_id"],
+                            inv_row["shopify_order_id"],
+                            amount_paise,
+                            RefundStatus.INITIATED.value,
+                            reason_code,
+                            staff_id,
+                            now,
+                            now,
+                        ),
+                    )
+                    conn.execute("COMMIT;")
+                except Exception:
+                    conn.execute("ROLLBACK;")
+                    raise
+
+        return self.get_refund(refund_id)
+
+    def allocate_and_persist_credit_note(
+        self,
+        refund_id: str,
+        store_code: str,
+        financial_year: str,
+    ) -> str:
+        """Atomically allocate and assign the next sequential credit note number to a confirmed refund.
+
+        Uses BEGIN IMMEDIATE transaction to guarantee atomic serialization.
+        Format: ELU/{store_code}/{financial_year}/CN/{seq:05d}
+
+        Idempotency:
+        If credit_note_no is ALREADY allocated for this refund (e.g. during recovery),
+        it returns the existing credit_note_no without consuming a new sequence number.
+        """
+        now = self._now_iso()
+        with self._lock:
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    cur = conn.execute("SELECT credit_note_no FROM refunds WHERE refund_id = ?;", (refund_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"Refund {refund_id} not found")
+
+                    if row["credit_note_no"]:
+                        conn.execute("COMMIT;")
+                        return row["credit_note_no"]
+
+                    cur = conn.execute(
+                        "SELECT next_seq FROM credit_note_sequences WHERE store_code = ? AND financial_year = ?;",
+                        (store_code, financial_year),
+                    )
+                    seq_row = cur.fetchone()
+                    if seq_row is None:
+                        seq = 1
+                        next_seq = 2
+                        conn.execute(
+                            "INSERT INTO credit_note_sequences (store_code, financial_year, next_seq, updated_at) VALUES (?, ?, ?, ?);",
+                            (store_code, financial_year, next_seq, now),
+                        )
+                    else:
+                        seq = seq_row["next_seq"]
+                        next_seq = seq + 1
+                        conn.execute(
+                            "UPDATE credit_note_sequences SET next_seq = ?, updated_at = ? WHERE store_code = ? AND financial_year = ?;",
+                            (next_seq, now, store_code, financial_year),
+                        )
+
+                    credit_note_no = f"ELU/{store_code}/{financial_year}/CN/{seq:05d}"
+                    conn.execute(
+                        "UPDATE refunds SET credit_note_no = ?, updated_at = ? WHERE refund_id = ?;",
+                        (credit_note_no, now, refund_id),
+                    )
+                    conn.execute("COMMIT;")
+                    return credit_note_no
+                except Exception:
+                    conn.execute("ROLLBACK;")
+                    raise
+
     def allocate_credit_note_no(self, store_code: str, financial_year: str) -> str:
         """Atomically allocate the next sequential credit note number per store.
 
@@ -691,6 +866,7 @@ class InvoiceRepository:
         self,
         refund_id: str,
         terminal_refund_id: str,
+        baseline_refunded_paise: int = 0,
     ) -> None:
         """Mark refund as captured on physical/UPI terminal."""
         now = self._now_iso()
@@ -698,10 +874,10 @@ class InvoiceRepository:
             conn.execute(
                 """
                 UPDATE refunds
-                SET status = ?, terminal_refund_id = ?, updated_at = ?
+                SET status = ?, terminal_refund_id = ?, baseline_refunded_paise = ?, updated_at = ?
                 WHERE refund_id = ?;
                 """,
-                (RefundStatus.TERMINAL_REFUNDED.value, terminal_refund_id, now, refund_id),
+                (RefundStatus.TERMINAL_REFUNDED.value, terminal_refund_id, baseline_refunded_paise, now, refund_id),
             )
 
     def update_refund_completed(
