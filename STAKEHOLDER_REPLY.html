@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page {
+    size: A4;
+    margin: 15mm 18mm 15mm 18mm;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 8.5pt;
+    line-height: 1.2;
+    color: #111;
+  }
+  h1 { font-size: 14pt; margin: 0 0 4px 0; }
+  h2 { font-size: 11pt; margin: 8px 0 3px 0; border-bottom: 1px solid #ccc; padding-bottom: 2px; }
+  h3 { font-size: 9.5pt; margin: 5px 0 2px 0; }
+  p { margin: 2px 0 3px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 4px 0; font-size: 8.5pt; }
+  th, td { border: 1px solid #888; padding: 3px 5px; text-align: left; }
+  th { background: #f0f0f0; font-weight: bold; }
+  ul, ol { margin: 2px 0 3px 0; padding-left: 16px; }
+  li { margin-bottom: 1px; }
+  code { font-family: Consolas, monospace; font-size: 8.5pt; background: #f4f4f4; padding: 1px 2px; }
+  hr { border: 0; border-top: 1px solid #ddd; margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>Response to Stakeholder Thread: Eluno POS v1</h1>
+<p><strong>To:</strong> Rohan (Founder), Meena (Retail Head), Dr. Iyer (Optometry Manager), Vikram (Finance), Farhan (Ops/Fulfilment)<br />
+<strong>From:</strong> Priya (Product) &amp; POS Engineering Team | <strong>Date:</strong> 4 Nov 2026 | <strong>Subject:</strong> Scoped Plan &amp; Clarifications for POS v1 (Go-Live: 15 Nov)</p>
+<hr />
+<p>Team, to replace Shopify POS across all 7 stores by 15 November, our priority is <strong>uncompromising correctness</strong>: every rupee, tax paisa, and inventory movement must reconcile with Shopify and tax authorities. Speed will be achieved through clean architecture without bypassing audit controls.</p>
+<hr />
+<h2>1. Key Questions for Stakeholders</h2>
+<table>
+<thead>
+<tr>
+  <th>Stakeholder</th>
+  <th>Question</th>
+  <th>Why It Matters for v1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>Vikram (Finance)</strong></td>
+  <td>Confirm exact FY naming format (<code>ELU/{STORE}/FY26/{NO}</code>), GST e-invoicing (IRN) / B2B/B2C rules, and whether cancelled invoices need tax-portal filing or internal ledger retention.</td>
+  <td>Dictates local sequence schemas and statutory audit compliance.</td>
+</tr>
+<tr>
+  <td><strong>Retail &amp; Finance</strong></td>
+  <td>When discount rules conflict (e.g. higher-priority non-stackable offer vs. stackable set yielding greater savings), does the till maximize customer benefit or follow strict priority?</td>
+  <td>Dictates the optimization logic of the automated offer engine.</td>
+</tr>
+<tr>
+  <td><strong>Vikram &amp; Meena</strong></td>
+  <td>Meena requested up to 10% manager discount; Vikram mandated reason codes and approver identity. Can Retail and Finance confirm: (a) 10% cap approval, (b) reason codes, and (c) authentication via <code>staff_id</code> with <code>can_override_discount: true</code> in <code>staff.json</code>?</td>
+  <td>Balances floor agility with audit compliance without shared PINs.</td>
+</tr>
+<tr>
+  <td><strong>Dr. Iyer (Optometry)</strong></td>
+  <td>If a customer's prescription is missing or expired (<code>valid_until</code> passed), should the till hard-block lens configuration and route to SMT queue, or permit frame-only purchase?</td>
+  <td>Establishes clinical guardrails and prevents lab remakes.</td>
+</tr>
+<tr>
+  <td><strong>Farhan (Ops)</strong></td>
+  <td>What is the store SOP if network reconnection exceeds 15 minutes post-terminal payment?</td>
+  <td>Guides offline reconciliation and customer receipt handling.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. Scope Matrix: Building vs. Deferring</h2>
+<h3>In Scope for v1 (Must Requirements)</h3>
+<ol>
+<li><strong>Customer &amp; Rx Lookup:</strong> Phone search via Shopify; latest valid Rx from SMT (<code>/smt/prescriptions</code>). Cohorts (<code>priority</code>, campaigns) from Shopify customer tags.</li>
+<li><strong>Cart &amp; Lens Matrix Validation:</strong> Real-time validation of sphere, cylinder, and ADD against <code>rx_limits</code>, blocking invalid picks with clear staff prompts.</li>
+<li><strong>Automated Offer Engine:</strong> Date-effective rules from <code>offers.json</code> (stackability, priority, tags, pair bundles).</li>
+<li><strong>Date-Effective GST Engine (by HSN):</strong> Backward tax calculation from MRP to the paisa across 5 categories in <code>tax_rates.json</code>:<ul>
+<li><strong>HSN 90031900</strong> (Frames): 18% (1800 bps) | <strong>HSN 90015000</strong> (Lenses): 5% (500 bps from 2025-09-22; 12% prior)</li>
+<li><strong>HSN 90049000</strong> (Sunglasses): 18% (1800 bps) | <strong>HSN 90041000</strong> (Corrective spectacles unit): 5% (500 bps)</li>
+<li><strong>HSN 998599</strong> (Services: eye test / fitting): 18% (1800 bps)</li>
+</ul>
+</li>
+<li><strong>Durable Order Creation:</strong> Idempotent terminal charge followed by Shopify order creation carrying line attributes (<code>pair_ref</code>, <code>rx_id</code>, <code>for_customer_id</code>, HSN) and local sequential invoice numbers in <code>note_attributes</code>.</li>
+<li><strong>Full Refund &amp; Targeted Restock:</strong> Line-level tax reversal, credit notes, frame returned to billing store stock, and custom lens scrapped without restock.</li>
+<li><strong>Day-End Store Reconciliation Report:</strong> Daily report for store and date from Shopify orders (bill count, gross, taxable, CGST/SGST, discounts, refunds, payment splits).</li>
+</ol>
+<h3>Explicitly Deferred to v1.1 (Should Requirements &amp; Non-POS Tasks)</h3>
+<ul>
+<li><strong>Sales Channel Capture &amp; Reporting (Should):</strong> Tagging orders (<code>walk_in</code>, <code>whatsapp_booked</code>, <code>online_pickup</code>) and store channel reports.</li>
+<li><strong>Cash Till Sessions &amp; Drawer Tracking (Should):</strong> Opening float, petty cash paid-outs (tea, courier), paid-ins, and drawer variance.</li>
+<li><strong>Full Remake Workflow (Should/Stretch):</strong> Commercial liability allocation (lab vs. store vs. customer). Lens replacements bill referencing <code>parent_invoice_no</code>.</li>
+<li><strong>Automated 10 AM Daily Email Digest:</strong> Handled by a backend cron querying Shopify Admin API, outside the till client.</li>
+<li><strong>Queue Tool &amp; Facilities Maintenance:</strong> SMT questionnaire updates and Indiranagar footfall camera hardware repairs.</li>
+</ul>
+<hr />
+<h2>3. Contradictions, Risks &amp; Proposed Solutions</h2>
+<h3>A. The &lt;10-Second Target &amp; Measurement</h3>
+<p>We cannot promise a sub-10s checkout without measurement. Estimated latency breakdown:<br />
+<code>Total Time ≈ Staff Input + Local Calc (&lt;10ms) + Terminal Roundtrip (~2–5s unverified) + Shopify API (~1–2s unverified)</code><br />
+Telemetry will track p50/p95 times. Speed will come from in-memory processing and catalog caching, never by skipping audit controls.</p>
+<h3>B. Manager Discounts &amp; Non-Repudiable Attribution</h3>
+<p>The 10% cap requires formal Finance/Retail agreement. Overrides require authentication by a manager with <code>can_override_discount: true</code> in <code>staff.json</code>, recording approver <code>staff_id</code>, discount amount, and reason code (<code>WALKOUT_RESCUE</code>, <code>DAMAGE_ALLOWANCE</code>, <code>PRICE_MATCH</code>). No shared PINs.</p>
+<h3>C. Family Billing with Single Customer Constraint</h3>
+<p>One primary Shopify customer per order. Line items carry <code>pair_ref</code>, <code>rx_id</code>, and <code>for_customer_id</code> properties. Cross-account loyalty is deferred to v1.1.</p>
+<h3>D. Invoice Lifecycle &amp; Immutability</h3>
+<p>Sequential invoice numbers are generated atomically from local SQLite with strict states:</p>
+<ul>
+<li><code>POSTED</code>: Captured on terminal and confirmed in Shopify.</li>
+<li><code>PENDING_RECONCILIATION</code>: Terminal funds captured; awaiting Shopify sync. <strong>Never treated as cancelled; number is never reused.</strong></li>
+<li><code>CANCELLED</code>: Aborted pre-payment; retained for gapless tax audit sequences.</li>
+</ul>
+<h3>E. Network Resilience &amp; Safe Distributed Reconciliation</h3>
+<p>Shopify's REST API <code>/orders.json</code> lacks idempotency keys; blind retries risk duplicate orders and double-decremented stock. Furthermore, <strong>an immediate lookup returning no order does not prove creation failed</strong>, as downstream indexing delays occur.<br />
+<strong>Workflow:</strong> (1) Persist local intent with <code>invoice_no</code>. (2) Idempotent terminal charge (<code>order_ref = invoice_no</code>). (3) Store <code>charge_id</code> locally; mark invoice <code>PENDING_RECONCILIATION</code>. (4) Submit order to Shopify. If response is ambiguous (timeout, network drop), keep invoice <code>PENDING_RECONCILIATION</code> and reconcile by listing recent orders at that <code>location_id</code> and inspecting <code>note_attributes</code> locally (as Shopify lacks direct <code>note_attributes</code> filtering). Never blindly replay; retry only if failure is conclusively established. (5) Transition to <code>POSTED</code> upon confirmed sync.</p>
+<h3>F. Prescription Source of Truth &amp; Axis Validation</h3>
+<p>Shopify customer <code>tags</code> supply priority/campaign markers; SMT supplies prescriptions. SMT entry forms must enforce the 5° grid; POS will display an informational advisory for off-grid external prescriptions (e.g. 172°) without blocking checkout.</p>
+<hr />
+<h2>4. Production Dependencies &amp; Launch Checklist</h2>
+<ol>
+<li><strong>Shopify Admin API Credentials:</strong> Custom App token with scopes: <code>read_products</code>, <code>read_customers</code>, <code>read_inventory</code>, <code>write_inventory</code>, <code>read_orders</code>, and <code>write_orders</code>, plus verified rate limits.</li>
+<li><strong>Payment Terminal Integration:</strong> SDK/API specs, idempotent retry docs, and payment terminal refund API and reconciliation documentation.</li>
+<li><strong>Staff Identity &amp; SMT Services:</strong> Production SMT endpoints for <code>/smt/prescriptions</code> and <code>/smt/staff</code>, including staff authentication and permission verification.</li>
+<li><strong>Finance &amp; Tax Compliance:</strong> Approved FY naming convention, credit note prefix, sign-off on date-effective HSN rates, and confirmation of GST e-invoicing applicability, IRN generation, B2B/B2C reporting, and credit-note filing rules.</li>
+<li><strong>Hardware Specifications:</strong> Driver specifications for ESC/POS thermal receipt printers and USB/Bluetooth barcode scanners.</li>
+</ol>
+<hr />
+<p><em>The engineering team is ready to begin Phase 1 upon approval.</em></p>
+
+</body>
+</html>
