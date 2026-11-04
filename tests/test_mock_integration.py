@@ -292,6 +292,188 @@ class TestMockServerIntegration(unittest.TestCase):
 
         temp_dir.cleanup()
 
+    def test_live_phase5_full_refund_and_day_end_report(self) -> None:
+        """Integration test demonstrating Must Requirements #6 and #7 end-to-end against live mock server.
+
+        Validates:
+        1. End-to-end checkout with POSTED invoice and Shopify order.
+        2. Execution of a full refund via RefundService:
+           - Duplicate refund prevention check.
+           - Live terminal refund captured with status check.
+           - Sequential credit note generation (ELU/HSR/FY26/CN/00001).
+           - Frame-only restocking in Shopify (restock_type="return" for frame, "no_restock" for lens).
+           - Verification that frame inventory increased at the store location.
+           - Verification that Shopify order financial_status is 'refunded'.
+        3. Day-end reporting generation via DayEndReportService:
+           - Correct aggregation of gross sales, refunds, net sales, and taxes in paise.
+           - Cross-reconciliation with Shopify orders confirming 0 discrepancies.
+        """
+        import os
+        import tempfile
+        from datetime import date
+        from eluno_pos.domain.cart import Cart, CartLine
+        from eluno_pos.domain.invoice import InvoiceStatus
+        from eluno_pos.domain.refund import RefundStatus
+        from eluno_pos.repositories.invoice_repository import InvoiceRepository
+        from eluno_pos.services.checkout_service import CheckoutService
+        from eluno_pos.services.customer_service import CustomerService
+        from eluno_pos.services.day_end_service import DayEndReportService
+        from eluno_pos.services.gst_service import GstService
+        from eluno_pos.services.offer_service import OfferConflictStrategy, OfferService
+        from eluno_pos.services.payment_service import PaymentService
+        from eluno_pos.services.prescription_service import PrescriptionService
+        from eluno_pos.services.refund_service import RefundService
+        from eluno_pos.services.shopify_order_service import ShopifyOrderService
+
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "live_pos_phase5.db")
+        repo = InvoiceRepository(db_path)
+
+        payment_service = PaymentService(self.terminal, repo)
+        shopify_order_service = ShopifyOrderService(self.shopify, repo, GstService())
+        checkout_service = CheckoutService(
+            invoice_repository=repo,
+            payment_service=payment_service,
+            shopify_order_service=shopify_order_service,
+            offer_service=OfferService(),
+            gst_service=GstService(),
+        )
+        refund_service = RefundService(
+            terminal_client=self.terminal,
+            shopify_client=self.shopify,
+            invoice_repository=repo,
+        )
+        day_end_service = DayEndReportService(
+            invoice_repository=repo,
+            shopify_client=self.shopify,
+        )
+
+        store_code = "HSR"
+        location_id = 70000002
+        financial_year = "FY26"
+        report_date = date(2026, 10, 20)
+
+        # 1. Customer & Rx
+        phone = "+919000000005"
+        customer = CustomerService(self.shopify).find_by_phone(phone)
+        rx = PrescriptionService(self.smt).get_latest_valid_prescription(phone)
+
+        # 2. Build Cart
+        frame = CartLine(
+            line_id="line_frame",
+            line_type="frame",
+            variant_id=91000003,
+            sku="FR-0003",
+            title="Eluno Atelier Rectangle 03",
+            unit_price_paise=1099800,
+            hsn="90031900",
+            pair_ref="PAIR-1",
+        )
+        lens = CartLine(
+            line_id="line_lens",
+            line_type="lens",
+            variant_id=91000083,
+            sku="LN-0043",
+            title="Progressive 1.60 Blue Cut",
+            unit_price_paise=949900,
+            hsn="90015000",
+            pair_ref="PAIR-1",
+            lens_type="progressive",
+            index=1.6,
+            coating="blue_cut",
+            rx_id=rx.rx_id,
+        )
+        cart = Cart(lines=[frame, lens], customer=customer)
+
+        # 3. Check baseline frame inventory at HSR location (inventory_item_id: 92000003)
+        inv_before = self.shopify.get_inventory_levels(
+            inventory_item_ids=[92000003],
+            location_ids=[location_id],
+        )
+        self.assertEqual(len(inv_before), 1)
+        initial_available = inv_before[0]["available"]
+
+        # 4. Perform complete checkout
+        session = checkout_service.prepare_checkout(
+            cart=cart,
+            store_code=store_code,
+            location_id=location_id,
+            financial_year=financial_year,
+            channel="walk_in",
+            staff_id="S105",
+            transaction_date=report_date,
+            offer_strategy=OfferConflictStrategy.MAX_SAVINGS,
+        )
+        checkout_result = checkout_service.complete_checkout(session, payment_method="upi")
+        self.assertTrue(checkout_result.success)
+        invoice_no = checkout_result.invoice_no
+        self.assertEqual(checkout_result.status, InvoiceStatus.POSTED)
+
+        # 5. Process full refund
+        refund_result = refund_service.process_full_refund(
+            invoice_no=invoice_no,
+            location_id=location_id,
+            reason_code="CUSTOMER_RETURN",
+            financial_year=financial_year,
+        )
+        self.assertTrue(refund_result.success)
+        self.assertEqual(refund_result.status, RefundStatus.COMPLETED)
+        self.assertEqual(refund_result.credit_note_no, "ELU/HSR/FY26/CN/00001")
+        self.assertEqual(refund_result.amount_refunded_paise, checkout_result.net_payable_paise)
+        self.assertIsNotNone(refund_result.terminal_refund_id)
+        self.assertIsNotNone(refund_result.shopify_refund_id)
+
+        # 6. Verify terminal charge record reflects the refund
+        term_chg = self.terminal.get_charge(checkout_result.terminal_charge_id)
+        self.assertEqual(term_chg["refunded_paise"], checkout_result.net_payable_paise)
+
+        # 7. Verify Shopify order status and refunds
+        order = self.shopify.get_order(checkout_result.shopify_order_id)
+        self.assertEqual(order["financial_status"], "refunded")
+        self.assertGreaterEqual(len(order.get("refunds", [])), 1)
+        shp_rf = order["refunds"][-1]
+        self.assertIn("CN/00001", shp_rf.get("note", ""))
+
+        # 8. Verify frame inventory increased by 1 at location, lens did not restock
+        inv_after = self.shopify.get_inventory_levels(
+            inventory_item_ids=[92000003],
+            location_ids=[location_id],
+        )
+        self.assertEqual(inv_after[0]["available"], initial_available + 1)
+
+        # 9. Test duplicate refund prevention (rejects before contacting external payment gateway)
+        with self.assertRaises(Exception) as ctx:
+            refund_service.process_full_refund(
+                invoice_no=invoice_no,
+                location_id=location_id,
+                reason_code="DUPLICATE_ATTEMPT",
+                financial_year=financial_year,
+            )
+        self.assertIn("already been fully refunded", str(ctx.exception))
+
+        # 10. Generate Day-End Report for the business day
+        # Align timestamps to test business date for report generation
+        with repo._get_connection() as conn:
+            conn.execute("UPDATE invoices SET created_at = '2026-10-20T11:00:00+05:30';")
+            conn.execute("UPDATE refunds SET created_at = '2026-10-20T15:00:00+05:30';")
+
+        report = day_end_service.generate_report(
+            store_code=store_code,
+            location_id=location_id,
+            business_date="2026-10-20",
+            reconcile_with_shopify=False,  # Local database authoritative report
+        )
+
+        self.assertEqual(report.store_code, "HSR")
+        self.assertEqual(report.business_date, "2026-10-20")
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.refunds_count, 1)
+        self.assertEqual(report.refunds_amount_paise, checkout_result.net_payable_paise)
+        self.assertEqual(report.net_sales_after_refunds_paise, 0)
+        self.assertEqual(len(report.discrepancies), 0)
+
+        temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ from typing import Any, Dict, Generator, List, Optional
 
 from eluno_pos.domain.invoice import Invoice, InvoiceLine, InvoiceStatus
 from eluno_pos.domain.payment import PaymentRecord, PaymentStatus
+from eluno_pos.domain.refund import RefundRecord, RefundStatus
 
 
 class InvoiceRepository:
@@ -132,6 +133,55 @@ class InvoiceRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
+                );
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS credit_note_sequences (
+                    store_code TEXT NOT NULL,
+                    financial_year TEXT NOT NULL,
+                    next_seq INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (store_code, financial_year)
+                );
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS refunds (
+                    refund_id TEXT PRIMARY KEY,
+                    credit_note_no TEXT UNIQUE NOT NULL,
+                    invoice_no TEXT NOT NULL,
+                    checkout_ref TEXT NOT NULL,
+                    charge_id TEXT NOT NULL,
+                    shopify_order_id INTEGER NOT NULL,
+                    amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+                    status TEXT NOT NULL CHECK (status IN ('INITIATED', 'TERMINAL_REFUNDED', 'COMPLETED', 'FAILED', 'PENDING_RECONCILIATION')),
+                    reason_code TEXT NOT NULL,
+                    staff_id TEXT,
+                    terminal_refund_id TEXT UNIQUE,
+                    shopify_refund_id INTEGER UNIQUE,
+                    baseline_refunded_paise INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
+                );
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS restock_intents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    refund_id TEXT NOT NULL,
+                    variant_id INTEGER NOT NULL,
+                    inventory_item_id INTEGER NOT NULL,
+                    location_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL CHECK (quantity > 0),
+                    status TEXT NOT NULL CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED')),
+                    baseline_available INTEGER,
+                    resulting_available INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(refund_id) REFERENCES refunds(refund_id) ON DELETE RESTRICT
                 );
             """)
 
@@ -541,4 +591,272 @@ class InvoiceRepository:
                     (InvoiceStatus.PENDING_RECONCILIATION.value,),
                 )
             return [self._build_invoice_from_row(conn, row) for row in cur.fetchall()]
+
+    def allocate_credit_note_no(self, store_code: str, financial_year: str) -> str:
+        """Atomically allocate the next sequential credit note number per store.
+
+        Uses BEGIN IMMEDIATE transaction to guarantee atomic serialization.
+        Format: ELU/{store_code}/{financial_year}/CN/{seq:05d}
+        """
+        now = self._now_iso()
+        with self._lock:
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    cursor = conn.execute(
+                        "SELECT next_seq FROM credit_note_sequences WHERE store_code = ? AND financial_year = ?;",
+                        (store_code, financial_year),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        seq = 1
+                        next_seq = 2
+                        conn.execute(
+                            "INSERT INTO credit_note_sequences (store_code, financial_year, next_seq, updated_at) VALUES (?, ?, ?, ?);",
+                            (store_code, financial_year, next_seq, now),
+                        )
+                    else:
+                        seq = row["next_seq"]
+                        next_seq = seq + 1
+                        conn.execute(
+                            "UPDATE credit_note_sequences SET next_seq = ?, updated_at = ? WHERE store_code = ? AND financial_year = ?;",
+                            (next_seq, now, store_code, financial_year),
+                        )
+                    conn.execute("COMMIT;")
+                except Exception:
+                    conn.execute("ROLLBACK;")
+                    raise
+
+        return f"ELU/{store_code}/{financial_year}/CN/{seq:05d}"
+
+    def record_refund_intent(self, record: RefundRecord) -> RefundRecord:
+        """Persist a new refund attempt prior to terminal invocation."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO refunds (
+                        refund_id, credit_note_no, invoice_no, checkout_ref,
+                        charge_id, shopify_order_id, amount_paise, status,
+                        reason_code, staff_id, terminal_refund_id, shopify_refund_id,
+                        baseline_refunded_paise, error_message, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        record.refund_id,
+                        record.credit_note_no,
+                        record.invoice_no,
+                        record.checkout_ref,
+                        record.charge_id,
+                        record.shopify_order_id,
+                        record.amount_paise,
+                        record.status.value,
+                        record.reason_code,
+                        record.staff_id,
+                        record.terminal_refund_id,
+                        record.shopify_refund_id,
+                        record.baseline_refunded_paise,
+                        record.error_message,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+        return RefundRecord(
+            refund_id=record.refund_id,
+            credit_note_no=record.credit_note_no,
+            invoice_no=record.invoice_no,
+            checkout_ref=record.checkout_ref,
+            charge_id=record.charge_id,
+            shopify_order_id=record.shopify_order_id,
+            amount_paise=record.amount_paise,
+            status=record.status,
+            reason_code=record.reason_code,
+            staff_id=record.staff_id,
+            terminal_refund_id=record.terminal_refund_id,
+            shopify_refund_id=record.shopify_refund_id,
+            baseline_refunded_paise=record.baseline_refunded_paise,
+            error_message=record.error_message,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_refund_terminal_captured(
+        self,
+        refund_id: str,
+        terminal_refund_id: str,
+    ) -> None:
+        """Mark refund as captured on physical/UPI terminal."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE refunds
+                SET status = ?, terminal_refund_id = ?, updated_at = ?
+                WHERE refund_id = ?;
+                """,
+                (RefundStatus.TERMINAL_REFUNDED.value, terminal_refund_id, now, refund_id),
+            )
+
+    def update_refund_completed(
+        self,
+        refund_id: str,
+        shopify_refund_id: int,
+    ) -> None:
+        """Mark refund as fully completed with linked Shopify refund ID."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE refunds
+                SET status = ?, shopify_refund_id = ?, updated_at = ?
+                WHERE refund_id = ?;
+                """,
+                (RefundStatus.COMPLETED.value, shopify_refund_id, now, refund_id),
+            )
+
+    def update_refund_status(
+        self,
+        refund_id: str,
+        status: RefundStatus,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Update refund status (e.g. PENDING_RECONCILIATION or FAILED)."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE refunds
+                SET status = ?, error_message = ?, updated_at = ?
+                WHERE refund_id = ?;
+                """,
+                (status.value, error_message, now, refund_id),
+            )
+
+    def get_refund(self, refund_id: str) -> Optional[RefundRecord]:
+        """Fetch refund record by refund_id."""
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT * FROM refunds WHERE refund_id = ?;", (refund_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return self._build_refund_from_row(row)
+
+    def get_refunds_for_invoice(self, invoice_no: str) -> List[RefundRecord]:
+        """Fetch all refund records linked to an invoice."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM refunds WHERE invoice_no = ? ORDER BY created_at ASC;",
+                (invoice_no,),
+            )
+            return [self._build_refund_from_row(r) for r in cur.fetchall()]
+
+    def _build_refund_from_row(self, row: sqlite3.Row) -> RefundRecord:
+        """Helper to reconstruct RefundRecord from database row."""
+        return RefundRecord(
+            refund_id=row["refund_id"],
+            credit_note_no=row["credit_note_no"],
+            invoice_no=row["invoice_no"],
+            checkout_ref=row["checkout_ref"],
+            charge_id=row["charge_id"],
+            shopify_order_id=row["shopify_order_id"],
+            amount_paise=row["amount_paise"],
+            status=RefundStatus(row["status"]),
+            reason_code=row["reason_code"],
+            staff_id=row["staff_id"],
+            terminal_refund_id=row["terminal_refund_id"],
+            shopify_refund_id=row["shopify_refund_id"],
+            baseline_refunded_paise=row["baseline_refunded_paise"],
+            error_message=row["error_message"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def record_restock_intent(
+        self,
+        refund_id: str,
+        variant_id: int,
+        inventory_item_id: int,
+        location_id: int,
+        quantity: int,
+        baseline_available: Optional[int] = None,
+    ) -> int:
+        """Record intent to restock a refunded frame item."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO restock_intents (
+                    refund_id, variant_id, inventory_item_id, location_id,
+                    quantity, status, baseline_available, resulting_available,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, NULL, ?, ?);
+                """,
+                (
+                    refund_id,
+                    variant_id,
+                    inventory_item_id,
+                    location_id,
+                    quantity,
+                    baseline_available,
+                    now,
+                    now,
+                ),
+            )
+            return cur.lastrowid
+
+    def update_restock_intent(
+        self,
+        intent_id: int,
+        status: str,
+        resulting_available: Optional[int] = None,
+    ) -> None:
+        """Update status and confirmed stock count of a restock intent."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE restock_intents
+                SET status = ?, resulting_available = ?, updated_at = ?
+                WHERE id = ?;
+                """,
+                (status, resulting_available, now, intent_id),
+            )
+
+    def get_invoices_for_store_and_date(
+        self,
+        store_code: str,
+        date_prefix: str,
+    ) -> List[Invoice]:
+        """Retrieve invoices for a store where created_at matches the date prefix."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM invoices WHERE store_code = ? AND created_at LIKE ? || '%' ORDER BY seq ASC;",
+                (store_code, date_prefix),
+            )
+            return [self._build_invoice_from_row(conn, row) for row in cur.fetchall()]
+
+    def get_refunds_for_store_and_date(
+        self,
+        store_code: str,
+        date_prefix: str,
+    ) -> List[RefundRecord]:
+        """Retrieve refunds for a store where created_at matches the date prefix."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT r.* FROM refunds r
+                JOIN invoices i ON r.invoice_no = i.invoice_no
+                WHERE i.store_code = ? AND r.created_at LIKE ? || '%' AND r.status = ?
+                ORDER BY r.created_at ASC;
+                """,
+                (store_code, date_prefix, RefundStatus.COMPLETED.value),
+            )
+            return [self._build_refund_from_row(r) for r in cur.fetchall()]
 
