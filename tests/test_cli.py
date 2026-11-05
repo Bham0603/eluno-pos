@@ -997,6 +997,7 @@ class TestCli(unittest.TestCase):
         with patch("sys.stdout", captured_h_valid), \
              patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
              patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
+             patch.object(self.ctx.shopify_client, "get_order", return_value={"id": 99000100, "line_items": []}), \
              patch.object(self.ctx.terminal_client, "get_charge", return_value={"status": "captured", "amount_paise": 100000, "refunded_paise": 0}), \
              patch.object(self.ctx.terminal_client, "create_refund", return_value={"status": "refunded", "refund_id": "trf_100"}), \
              patch.object(self.ctx.shopify_client, "create_refund", return_value={"id": 88000100}):

@@ -177,10 +177,79 @@ class TestDayEndReportService(unittest.TestCase):
             conn.execute("UPDATE invoices SET created_at = '2026-10-20T10:00:00+05:30';")
             conn.execute("UPDATE refunds SET created_at = '2026-10-20T16:00:00+05:30';")
 
-        # Mock Shopify orders response matching the 2 posted orders
+        # Mock Shopify orders response matching the 2 posted orders with realistic payloads
         self.mock_shopify.get_orders.return_value = [
-            {"id": 95000001, "total_price": "10000.00", "created_at": f"{business_date}T10:00:00+05:30"},
-            {"id": 95000002, "total_price": "5000.00", "created_at": f"{business_date}T14:30:00+05:30"},
+            {
+                "id": 95000001,
+                "location_id": 70000002,
+                "financial_status": "refunded",
+                "subtotal_price": "10000.00",
+                "total_discounts": "0.00",
+                "total_price": "10000.00",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "note_attributes": [
+                    {"name": "payment_method", "value": "upi"},
+                    {"name": "channel", "value": "walk_in"},
+                ],
+                "line_items": [
+                    {
+                        "id": 96000001,
+                        "sku": "SKU-L1",
+                        "price": "10000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}, {"name": "line_type", "value": "frame"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "762.71"},
+                            {"title": "SGST", "price": "762.71"},
+                        ],
+                    }
+                ],
+                "refunds": [
+                    {
+                        "id": 98000001,
+                        "order_id": 95000001,
+                        "created_at": f"{business_date}T16:00:00+05:30",
+                        "transactions": [{"kind": "refund", "status": "success", "amount": "10000.00"}],
+                        "refund_line_items": [
+                            {
+                                "line_item_id": 96000001,
+                                "quantity": 1,
+                                "subtotal": "8474.58",
+                                "total_tax": "1525.42",
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "id": 95000002,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "created_at": f"{business_date}T14:30:00+05:30",
+                "note_attributes": [
+                    {"name": "payment_method", "value": "card"},
+                    {"name": "channel", "value": "whatsapp_booked"},
+                ],
+                "line_items": [
+                    {
+                        "id": 96000002,
+                        "sku": "SKU-L2",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}, {"name": "line_type", "value": "lens"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "119.05"},
+                            {"title": "SGST", "price": "119.05"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            },
         ]
 
         report = self.service.generate_report(
@@ -701,6 +770,408 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertEqual(hsn_stat.sales_taxable_paise, 847458)
         self.assertEqual(hsn_stat.refund_taxable_paise, 847458)
         self.assertEqual(hsn_stat.net_taxable_paise, 0)
+
+    def test_shopify_order_payloads_determine_financial_totals_when_sqlite_differs(self) -> None:
+        """Requirement 1: Shopify order payloads determine financial figures even when SQLite totals deliberately differ."""
+        business_date = "2026-10-20"
+
+        # 1. Local SQLite has only 1 invoice for ₹5,000
+        inv = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_local_diff",
+            customer_id=80001001,
+            gross_paise=500000,
+            discount_paise=0,
+            net_paise=500000,
+            taxable_paise=476190,
+            tax_paise=23810,
+            lines=[self._create_line("L_LOCAL", "lens", 500000, "90015000", 476190, 11905, 11905, 23810)],
+        )
+        self.repo.update_invoice_payment(inv.invoice_no, "chg_local_diff")
+        self.repo.update_invoice_shopify_order(inv.invoice_no, 95000099, InvoiceStatus.POSTED)
+        with self.repo._get_connection() as conn:
+            conn.execute("UPDATE invoices SET created_at = '2026-10-20T10:00:00+05:30';")
+
+        # 2. Shopify Admin API returns 2 orders totaling ₹20,000 gross and ₹2,000 discounts (₹18,000 net)
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": 95000101,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "1000.00",
+                "total_price": "9000.00",
+                "created_at": f"{business_date}T11:00:00+05:30",
+                "note_attributes": [
+                    {"name": "payment_method", "value": "upi"},
+                    {"name": "channel", "value": "walk_in"},
+                ],
+                "line_items": [
+                    {
+                        "id": 96000101,
+                        "sku": "FR-0001",
+                        "price": "10000.00",
+                        "quantity": 1,
+                        "total_discount": "1000.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}, {"name": "line_type", "value": "frame"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "686.44"},
+                            {"title": "SGST", "price": "686.44"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            },
+            {
+                "id": 95000102,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "1000.00",
+                "total_price": "9000.00",
+                "created_at": f"{business_date}T15:00:00+05:30",
+                "note_attributes": [
+                    {"name": "payment_method", "value": "card"},
+                    {"name": "channel", "value": "walk_in"},
+                ],
+                "line_items": [
+                    {
+                        "id": 96000102,
+                        "sku": "LN-0001",
+                        "price": "10000.00",
+                        "quantity": 1,
+                        "total_discount": "1000.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}, {"name": "line_type", "value": "lens"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "214.29"},
+                            {"title": "SGST", "price": "214.29"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            },
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Financial totals must come from Shopify orders, NOT local SQLite!
+        self.assertEqual(report.posted_sales_count, 2)
+        self.assertEqual(report.gross_sales_paise, 2000000)      # ₹20,000.00 (from Shopify)
+        self.assertEqual(report.total_discounts_paise, 200000)   # ₹2,000.00 (from Shopify)
+        self.assertEqual(report.net_sales_paise, 1800000)        # ₹18,000.00 (from Shopify)
+
+        # Taxable and GST values from Shopify line items
+        self.assertEqual(report.sales_cgst_paise, 68644 + 21429)
+        self.assertEqual(report.sales_sgst_paise, 68644 + 21429)
+        self.assertEqual(report.sales_total_gst_paise, (68644 + 21429) * 2)
+
+        # Discrepancies flagged due to intentional difference from SQLite (1 vs 2 bills)
+        self.assertFalse(report.is_reconciled)
+        self.assertTrue(any("Bill count mismatch" in d for d in report.discrepancies))
+        self.assertTrue(any("Net sales mismatch" in d for d in report.discrepancies))
+
+    def test_cross_date_refund_from_older_order_included_in_today_report(self) -> None:
+        """Requirement 4 & 5: A refund on the target business date against an older order is included."""
+        sale_date = "2026-10-10"
+        refund_date = "2026-10-20"
+
+        # Older order created on 2026-10-10, with refund created on 2026-10-20
+        older_order_with_refund = {
+            "id": 95000201,
+            "location_id": 70000002,
+            "financial_status": "refunded",
+            "subtotal_price": "12998.00",
+            "total_discounts": "0.00",
+            "total_price": "12998.00",
+            "created_at": f"{sale_date}T11:00:00+05:30",
+            "note_attributes": [
+                {"name": "payment_method", "value": "upi"},
+                {"name": "channel", "value": "walk_in"},
+            ],
+            "line_items": [
+                {
+                    "id": 96000201,
+                    "sku": "FR-0001",
+                    "price": "12998.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}, {"name": "line_type", "value": "frame"}],
+                    "tax_lines": [
+                        {"title": "CGST", "price": "991.37"},
+                        {"title": "SGST", "price": "991.37"},
+                    ],
+                }
+            ],
+            "refunds": [
+                {
+                    "id": 98000201,
+                    "order_id": 95000201,
+                    "created_at": f"{refund_date}T15:30:00+05:30",
+                    "transactions": [
+                        {"kind": "refund", "status": "success", "amount": "12998.00"}
+                    ],
+                    "refund_line_items": [
+                        {
+                            "line_item_id": 96000201,
+                            "quantity": 1,
+                            "subtotal": "11015.26",
+                            "total_tax": "1982.74",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        self.mock_shopify.get_orders.return_value = [older_order_with_refund]
+
+        # Generate report for refund_date (2026-10-20)
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=refund_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Sale was on 2026-10-10, so 0 posted sales for today
+        self.assertEqual(report.posted_sales_count, 0)
+        self.assertEqual(report.gross_sales_paise, 0)
+        self.assertEqual(report.net_sales_paise, 0)
+
+        # Refund was on 2026-10-20, so exactly 1 refund counted!
+        self.assertEqual(report.refunds_count, 1)
+        self.assertEqual(report.refunds_amount_paise, 1299800)
+        self.assertEqual(report.net_sales_after_refunds_paise, -1299800)
+
+        # Refund tax reversal correctly extracted from refund line items
+        self.assertEqual(report.refund_taxable_value_paise, 1101526)
+        self.assertEqual(report.refund_cgst_paise, 99137)
+        self.assertEqual(report.refund_sgst_paise, 99137)
+        self.assertEqual(report.refund_total_gst_paise, 198274)
+
+        # HSN breakdown captures refund reversal
+        self.assertIn("90031900", report.hsn_totals)
+        hsn_stat = report.hsn_totals["90031900"]
+        self.assertEqual(hsn_stat.refund_taxable_paise, 1101526)
+        self.assertEqual(hsn_stat.refund_total_gst_paise, 198274)
+        self.assertEqual(hsn_stat.net_taxable_paise, -1101526)
+        self.assertEqual(hsn_stat.net_total_gst_paise, -198274)
+
+    def test_pending_and_cancelled_orders_excluded_from_sales(self) -> None:
+        """Requirement 6: Pending/unpaid orders are not counted as successful sales."""
+        business_date = "2026-10-20"
+
+        self.mock_shopify.get_orders.return_value = [
+            # 1. Paid order (Valid)
+            {
+                "id": 95000301,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "0.00",
+                "total_price": "10000.00",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "cancelled_at": None,
+                "line_items": [
+                    {
+                        "id": 96000301,
+                        "price": "10000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "tax_lines": [{"title": "CGST", "price": "762.71"}, {"title": "SGST", "price": "762.71"}],
+                    }
+                ],
+                "refunds": [],
+            },
+            # 2. Pending/unpaid order (Excluded)
+            {
+                "id": 95000302,
+                "location_id": 70000002,
+                "financial_status": "pending",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "created_at": f"{business_date}T12:00:00+05:30",
+                "cancelled_at": None,
+                "line_items": [{"id": 96000302, "price": "5000.00", "quantity": 1, "total_discount": "0.00", "tax_lines": []}],
+                "refunds": [],
+            },
+            # 3. Cancelled/voided order (Excluded)
+            {
+                "id": 95000303,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "8000.00",
+                "total_discounts": "0.00",
+                "total_price": "8000.00",
+                "created_at": f"{business_date}T14:00:00+05:30",
+                "cancelled_at": f"{business_date}T14:05:00+05:30",
+                "line_items": [{"id": 96000303, "price": "8000.00", "quantity": 1, "total_discount": "0.00", "tax_lines": []}],
+                "refunds": [],
+            },
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Only the 1 paid order is included
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 1000000)
+        self.assertEqual(report.net_sales_paise, 1000000)
+
+    def test_shopify_unavailability_triggers_sqlite_fallback_and_warning(self) -> None:
+        """Requirement 7 & 8: Local operational counts remain available and Shopify unavailability triggers fallback."""
+        business_date = "2026-10-20"
+
+        # 1. Local SQLite has 1 posted invoice, 1 cancelled invoice, and 1 pending invoice
+        inv = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_fallback_01",
+            customer_id=80001001,
+            gross_paise=1000000,
+            discount_paise=0,
+            net_paise=1000000,
+            taxable_paise=847458,
+            tax_paise=152542,
+            lines=[self._create_line("L_FB", "frame", 1000000, "90031900", 847458, 76271, 76271, 152542)],
+        )
+        self.repo.update_invoice_payment(inv.invoice_no, "chg_fb_01")
+        self.repo.update_invoice_shopify_order(inv.invoice_no, 95000401, InvoiceStatus.POSTED)
+
+        inv_canc = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_fallback_canc",
+            customer_id=80001002,
+            gross_paise=200000,
+            discount_paise=0,
+            net_paise=200000,
+            taxable_paise=169492,
+            tax_paise=30508,
+            lines=[],
+        )
+        self.repo.update_invoice_status(inv_canc.invoice_no, InvoiceStatus.CANCELLED)
+
+        inv_pend = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_fallback_pend",
+            customer_id=80001003,
+            gross_paise=300000,
+            discount_paise=0,
+            net_paise=300000,
+            taxable_paise=254237,
+            tax_paise=45763,
+            lines=[],
+        )
+
+        with self.repo._get_connection() as conn:
+            conn.execute("UPDATE invoices SET created_at = '2026-10-20T10:00:00+05:30';")
+
+        # 2. Simulate Shopify API failure / network timeout
+        self.mock_shopify.get_orders.side_effect = ConnectionError("Upstream Shopify Gateway Timeout")
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Fallback to SQLite completes successfully
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 1000000)
+        self.assertEqual(report.net_sales_paise, 1000000)
+
+        # Operational metrics remain accessible from SQLite
+        self.assertEqual(report.cancelled_invoices_count, 1)
+        self.assertEqual(report.pending_reconciliation_count, 1)
+
+        # Report marked not reconciled with explicit fallback warning
+        self.assertFalse(report.is_reconciled)
+        self.assertTrue(any("offline fallback" in d.lower() or "unavailable" in d.lower() for d in report.discrepancies))
+
+    def test_hsn_breakdown_and_payment_methods_extracted_from_shopify(self) -> None:
+        """Requirement 3: HSN breakdown and payment method are extracted from Shopify data."""
+        business_date = "2026-10-20"
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": 95000501,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "13997.00",
+                "total_discounts": "1299.80",
+                "total_price": "12697.20",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "note_attributes": [
+                    {"name": "payment_method", "value": "upi"},
+                    {"name": "channel", "value": "walk_in"},
+                ],
+                "line_items": [
+                    {
+                        "id": 96000501,
+                        "sku": "FR-0001",
+                        "price": "12998.00",
+                        "quantity": 1,
+                        "total_discount": "1299.80",
+                        "properties": [{"name": "hsn", "value": "90031900"}, {"name": "line_type", "value": "frame"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "892.24"},
+                            {"title": "SGST", "price": "892.23"},
+                        ],
+                    },
+                    {
+                        "id": 96000502,
+                        "sku": "LN-0001",
+                        "price": "999.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}, {"name": "line_type", "value": "lens"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "23.79"},
+                            {"title": "SGST", "price": "23.78"},
+                        ],
+                    },
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Payment method extracted from note_attributes
+        self.assertEqual(report.payment_method_totals.get("upi"), 1269720)
+        self.assertEqual(report.channel_totals.get("walk_in"), 1269720)
+
+        # HSN breakdown extracted from line properties
+        self.assertIn("90031900", report.hsn_totals)
+        self.assertIn("90015000", report.hsn_totals)
+
+        hsn_frame = report.hsn_totals["90031900"]
+        self.assertEqual(hsn_frame.sales_cgst_paise, 89224)
+        self.assertEqual(hsn_frame.sales_sgst_paise, 89223)
+        self.assertEqual(hsn_frame.sales_total_gst_paise, 178447)
+
+        hsn_lens = report.hsn_totals["90015000"]
+        self.assertEqual(hsn_lens.sales_cgst_paise, 2379)
+        self.assertEqual(hsn_lens.sales_sgst_paise, 2378)
+        self.assertEqual(hsn_lens.sales_total_gst_paise, 4757)
 
 
 if __name__ == "__main__":
