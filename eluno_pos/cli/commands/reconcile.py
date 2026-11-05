@@ -1,5 +1,6 @@
 """Reconciliation recovery command for Eluno POS CLI."""
 
+import json
 from typing import Optional
 
 from eluno_pos.cli.context import AppContext
@@ -76,10 +77,11 @@ def run_reconcile(
 
     # 2. Safety Gate: Allow only proved-safe recovery operations
     print("\n--- Safe Recovery Plan ---")
-    print("1. Queries payment terminal gateway for charge status (Never creates duplicate charges).")
-    print("2. Reconciles existing Shopify order/refund by idempotency key (Never creates duplicate orders/refunds).")
-    print("3. Allocates credit note only upon confirmed terminal capture.")
-    print("4. Unresolved/uncertain items remain PENDING for manual supervisor inspection.")
+    print("1. Queries payment terminal gateway for actual charge_id and status (Never creates duplicate charges).")
+    print("2. Compares refunded_paise against durable baseline to verify whether refund already executed.")
+    print("3. Reconciles Shopify orders using persisted invoice metadata (store_code, invoice_no, checkout_ref).")
+    print("4. Allocates credit note numbers sequentially ONLY upon confirmed terminal capture.")
+    print("5. Unresolved or ambiguous items remain safely PENDING for supervisor inspection.")
 
     should_run = execute_recovery
     if not should_run and not auto_confirm:
@@ -112,12 +114,52 @@ def run_reconcile(
             unresolved_count += 1
 
     # Recover pending refunds
-    locations = ctx.shopify_client.get_locations()
-    default_loc = int(locations[0]["id"]) if locations else 70000002
     for ref in pending_refunds:
         print(f"\n[Reconciling Refund: {ref.refund_id} for Invoice: {ref.invoice_no}]")
+        
+        # Determine persisted Shopify location ID from original invoice
+        inv = ctx.repo.get_invoice(ref.invoice_no)
+        persisted_loc_id: Optional[int] = None
+        
+        if inv:
+            # 1. Inspect persisted shopify_order_intents
+            with ctx.repo._get_connection() as conn:
+                cur = conn.execute("SELECT payload_json FROM shopify_order_intents WHERE invoice_no = ?;", (inv.invoice_no,))
+                row = cur.fetchone()
+                if row and row["payload_json"]:
+                    try:
+                        intent_payload = json.loads(row["payload_json"])
+                        persisted_loc_id = intent_payload.get("order", {}).get("location_id")
+                    except Exception:
+                        pass
+
+            # 2. Inspect Shopify order if already synced
+            if not persisted_loc_id and inv.shopify_order_id:
+                try:
+                    shopify_order = ctx.shopify_client.get_order(inv.shopify_order_id)
+                    if shopify_order and shopify_order.get("location_id"):
+                        persisted_loc_id = int(shopify_order["location_id"])
+                except Exception:
+                    pass
+
+            # 3. Inspect store locations mapping for invoice's store code
+            if not persisted_loc_id and inv.store_code:
+                try:
+                    all_locs = ctx.shopify_client.get_locations()
+                    matched_loc = next((l for l in all_locs if (l.get("eluno", {}).get("store_code") or l.get("store_code")) == inv.store_code), None)
+                    if matched_loc and matched_loc.get("id"):
+                        persisted_loc_id = int(matched_loc["id"])
+                except Exception:
+                    pass
+
+        if not persisted_loc_id:
+            print(f"  ✖ Error: Persisted Shopify location ID missing for invoice {ref.invoice_no}.")
+            print("    Operation kept PENDING for supervisor / manual resolution.")
+            unresolved_count += 1
+            continue
+
         try:
-            ref_res = ctx.refund_service.resume_or_reconcile_refund(ref.refund_id, location_id=default_loc)
+            ref_res = ctx.refund_service.resume_or_reconcile_refund(ref.refund_id, location_id=persisted_loc_id)
             if ref_res and ref_res.success:
                 print(f"  ✔ Refund Conclusively Reconciled! Credit Note: {ref_res.credit_note_no}, Shopify Refund: {ref_res.shopify_refund_id}")
                 reconciled_count += 1
@@ -143,4 +185,3 @@ def run_reconcile(
 
     print("\n✔ All operations successfully reconciled!\n")
     return 0
-

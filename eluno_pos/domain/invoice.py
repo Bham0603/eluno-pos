@@ -1,8 +1,26 @@
 """Invoice domain models and lifecycle states for Eluno POS."""
 
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+
+def get_financial_year(tx_date: Optional[date] = None) -> str:
+    """Derive Indian financial year (April 1 to March 31).
+
+    The Indian financial year runs from 1 April to 31 March of the following calendar year.
+    It is designated by the calendar year in which it concludes.
+    
+    Examples:
+    - 2025-03-31 -> FY25 (April 2024 - March 2025)
+    - 2025-04-01 -> FY26 (April 2025 - March 2026)
+    - 2026-03-31 -> FY26 (April 2025 - March 2026)
+    - 2026-04-01 -> FY27 (April 2026 - March 2027)
+    """
+    d = tx_date or date.today()
+    fy_year = d.year + 1 if d.month >= 4 else d.year
+    return f"FY{str(fy_year)[-2:]}"
 
 
 class InvoiceStatus(str, Enum):
@@ -42,6 +60,7 @@ class InvoiceLine:
     rx_id: Optional[str] = None
     lens_config: Optional[str] = None
     properties: List[Dict[str, str]] = field(default_factory=list)
+    for_customer_id: Optional[int] = None
 
 
 @dataclass

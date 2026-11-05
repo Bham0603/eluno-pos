@@ -126,6 +126,14 @@ class CheckoutService:
             sgst_paise = lt.sgst_paise if lt else 0
             tax_paise = lt.total_gst_paise if lt else 0
 
+            line_props = []
+            if line.pair_ref:
+                line_props.append({"name": "pair_ref", "value": str(line.pair_ref)})
+            if line.rx_id:
+                line_props.append({"name": "rx_id", "value": str(line.rx_id)})
+            if line.for_customer_id is not None:
+                line_props.append({"name": "for_customer_id", "value": str(line.for_customer_id)})
+
             inv_lines.append(
                 InvoiceLine(
                     line_id=line.line_id,
@@ -146,7 +154,8 @@ class CheckoutService:
                     pair_ref=line.pair_ref,
                     rx_id=line.rx_id,
                     lens_config=lens_cfg,
-                    properties=[],
+                    properties=line_props,
+                    for_customer_id=line.for_customer_id,
                 )
             )
 

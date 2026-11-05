@@ -76,6 +76,7 @@ def main(args: Optional[List[str]] = None) -> int:
                 lens_variant_id=parsed_args.lens,
                 rx_id=parsed_args.rx,
                 for_member=parsed_args.for_member,
+                for_customer_id=getattr(parsed_args, "for_customer_id", None),
                 manager_override_bps=parsed_args.manager_override_bps,
                 override_reason=parsed_args.override_reason,
                 override_manager_id=parsed_args.override_manager_id,

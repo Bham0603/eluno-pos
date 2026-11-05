@@ -390,6 +390,7 @@ class InvoiceRepository:
                     rx_id=l["rx_id"],
                     lens_config=l["lens_config"],
                     properties=props,
+                    for_customer_id=next((int(p["value"]) for p in props if p.get("name") == "for_customer_id" and str(p.get("value", "")).isdigit()), None),
                 )
             )
 

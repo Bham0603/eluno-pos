@@ -1,5 +1,6 @@
 """Customer lookup command for Eluno POS."""
 
+from datetime import date
 from typing import Optional
 
 from eluno_pos.cli.context import AppContext
@@ -43,20 +44,14 @@ def run_customer_lookup(ctx: AppContext, phone: Optional[str] = None) -> int:
         return 0
 
     print(f"  • Found {len(rxs)} prescription(s) on record:\n")
-    headers = ["Rx ID", "Test Date", "Clinic / Optom", "OD (Right Eye)", "OS (Left Eye)", "PD"]
+    headers = ["Rx ID", "Test Date", "Source / Optometrist", "Status", "Reading ADD"]
     rows = []
+    ref_date = date.today()
     for rx in rxs:
-        od_str = f"SPH: {rx.od.sph:+.2f}, CYL: {rx.od.cyl:+.2f}, AX: {rx.od.axis or '-'}"
-        if rx.od.add:
-            od_str += f", ADD: {rx.od.add:+.2f}"
-
-        os_str = f"SPH: {rx.os.sph:+.2f}, CYL: {rx.os.cyl:+.2f}, AX: {rx.os.axis or '-'}"
-        if rx.os.add:
-            os_str += f", ADD: {rx.os.add:+.2f}"
-
         optom_source = f"{rx.optometrist_id or 'SMT'} ({rx.source})"
-        pd_val = f"{rx.pd.binocular} mm" if rx.pd.binocular else "N/A"
-        rows.append([rx.rx_id, rx.date, optom_source, od_str, os_str, pd_val])
+        status_str = f"Valid (until {rx.valid_until})" if rx.is_valid_on(ref_date) else f"Expired ({rx.valid_until})"
+        add_present = "Yes" if (rx.od.add or rx.os.add) else "No"
+        rows.append([rx.rx_id, rx.date, optom_source, status_str, add_present])
 
     print_table(headers, rows)
     print()

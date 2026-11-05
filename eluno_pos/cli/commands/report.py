@@ -35,8 +35,12 @@ def run_report(
     target_loc_id = location_id
     if not target_loc_id:
         locations = ctx.shopify_client.get_locations()
-        matching_loc = next((l for l in locations if l.get("store_code") == target_store), locations[0] if locations else None)
-        target_loc_id = int(matching_loc["id"]) if matching_loc else 70000002
+        matching_loc = next((l for l in locations if (l.get("eluno", {}).get("store_code") or l.get("store_code")) == target_store), None)
+        if matching_loc:
+            target_loc_id = int(matching_loc["id"])
+        else:
+            print(f"✖ Error: Store code '{target_store}' not found in locations registry.")
+            return 1
 
     print(f"\nGenerating Day-End Report for Store '{target_store}' on {target_date} (Asia/Kolkata)...")
     try:

@@ -1,6 +1,15 @@
 """Terminal formatting and currency display helpers for Eluno POS CLI."""
 
+import sys
 from typing import Any, List, Optional, Sequence
+
+# Ensure UTF-8 output across all platforms (including Windows cmd/powershell cp1252)
+for _s in (sys.stdout, sys.stderr):
+    if _s and hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def format_inr(paise: int) -> str:
@@ -87,6 +96,8 @@ def print_card(title: str, items: Sequence[tuple[str, Any]]) -> None:
 def prompt_input(prompt_text: str, default: Optional[str] = None) -> str:
     """Prompt the user for input with an optional default value."""
     disp = f"{prompt_text} [{default}]: " if default else f"{prompt_text}: "
+    if sys.stdin and hasattr(sys.stdin, "isatty") and not sys.stdin.isatty():
+        return default or ""
     try:
         val = input(disp).strip()
         return val if val else (default or "")
@@ -97,6 +108,8 @@ def prompt_input(prompt_text: str, default: Optional[str] = None) -> str:
 def prompt_confirm(prompt_text: str, default: bool = False) -> bool:
     """Prompt user for a yes/no confirmation."""
     def_str = "Y/n" if default else "y/N"
+    if sys.stdin and hasattr(sys.stdin, "isatty") and not sys.stdin.isatty():
+        return default
     try:
         resp = input(f"{prompt_text} [{def_str}]: ").strip().lower()
         if not resp:

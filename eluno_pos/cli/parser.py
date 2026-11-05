@@ -51,11 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     checkout_p.add_argument("-l", "--lens", type=int, help="Lens product variant ID.")
     checkout_p.add_argument("-r", "--rx", help="Clinical prescription ID to link (e.g. RX5002).")
     checkout_p.add_argument("--for-member", help="Individual recipient name for family billing.")
-    checkout_p.add_argument("--manager-override", type=int, dest="manager_override_bps", help="Manager discount override in basis points (e.g. 500 for 5%).")
+    checkout_p.add_argument("--for-customer-id", "--wearer-id", type=int, dest="for_customer_id", help="Persisted customer ID of wearer/recipient.")
+    checkout_p.add_argument("--manager-override", type=int, dest="manager_override_bps", help="Manager discount override in basis points (e.g. 500 for 5%%).")
     checkout_p.add_argument("--override-reason", help="Mandatory audit reason code for manager discount.")
     checkout_p.add_argument("--override-manager-id", help="Staff ID of authorizing store manager.")
     checkout_p.add_argument("-m", "--method", default="upi", choices=["upi", "card", "cash"], help="Payment method (default: upi).")
-    checkout_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Auto-confirm payment capture gate (non-interactive mode).")
+    checkout_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, auto-confirming all prompts with safe defaults.")
 
     # 4. REFUND: Full return & credit note issuance
     refund_p = subparsers.add_parser("refund", help="Process full return, terminal reversal, and credit note issuance.")
@@ -63,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     refund_p.add_argument("--location", type=int, help="Store location ID for frame restocking.")
     refund_p.add_argument("--reason", default="CUSTOMER_RETURN", help="Return reason code (default: CUSTOMER_RETURN).")
     refund_p.add_argument("--staff", help="Authorizing staff ID.")
-    refund_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Auto-confirm refund authorization gate.")
+    refund_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, auto-confirming all prompts with safe defaults.")
 
     # 5. REPORT: Day-end store report
     report_p = subparsers.add_parser("report", help="Generate consolidated day-end sales, refund, and GST report.")
@@ -76,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_p = subparsers.add_parser("reconcile", help="Inspect and recover in-flight, ambiguous, or pending operations.")
     reconcile_p.add_argument("-s", "--store", help="Filter pending transactions by store code.")
     reconcile_p.add_argument("-x", "--execute", action="store_true", help="Execute safe automated reconciliation routines.")
-    reconcile_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Auto-confirm recovery execution.")
+    reconcile_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, auto-confirming all prompts with safe defaults.")
 
     # 7. INVOICE: Document inspection
     invoice_p = subparsers.add_parser("invoice", help="Store tax invoice and audit inspection.")

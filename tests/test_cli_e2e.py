@@ -26,7 +26,7 @@ from eluno_pos.cli.commands.refund import run_refund
 from eluno_pos.cli.commands.report import run_report
 from eluno_pos.cli.context import AppContext
 from eluno_pos.config import AppConfig
-from eluno_pos.domain.invoice import InvoiceStatus
+from eluno_pos.domain.invoice import InvoiceStatus, get_financial_year
 from eluno_pos.domain.lens import LensVariant
 from eluno_pos.domain.validation import LensValidator
 from eluno_pos.repositories.invoice_repository import InvoiceRepository
@@ -157,7 +157,8 @@ class TestCliEndToEnd(unittest.TestCase):
         self.assertEqual(ret, 0)
 
         # Verify durable invoice record in SQLite
-        inv = self.repo.get_invoice("ELU/HSR/FY26/00001")
+        fy = get_financial_year()
+        inv = self.repo.get_invoice(f"ELU/HSR/{fy}/00001")
         self.assertIsNotNone(inv)
         self.assertEqual(inv.status, InvoiceStatus.POSTED)
         self.assertEqual(inv.store_code, store_code)
@@ -199,12 +200,14 @@ class TestCliEndToEnd(unittest.TestCase):
                 customer_phone=customer_phone,
                 frame_variant_id=frame_variant_id,
                 lens_variant_id=lens_variant_id,
+                rx_id="RX5002",
                 auto_confirm=False,
             )
             self.assertEqual(ret, 0)
 
         # Verify invoice was persisted as CANCELLED with no terminal charge
-        inv = self.repo.get_invoice("ELU/HSR/FY26/00001")
+        fy = get_financial_year()
+        inv = self.repo.get_invoice(f"ELU/HSR/{fy}/00001")
         self.assertIsNotNone(inv)
         self.assertEqual(inv.status, InvoiceStatus.CANCELLED)
         self.assertIsNone(inv.terminal_charge_id)
@@ -222,13 +225,14 @@ class TestCliEndToEnd(unittest.TestCase):
             lens_variant_id=91000041,
             auto_confirm=True,
         )
-        inv = self.repo.get_invoice("ELU/HSR/FY26/00001")
+        fy = get_financial_year()
+        inv = self.repo.get_invoice(f"ELU/HSR/{fy}/00001")
         self.assertIsNotNone(inv)
 
-        # Check initial frame inventory level at HSR (location 70000001, item 92000001)
+        # Check initial frame inventory level at HSR (location 70000002, item 92000001)
         initial_inv = self.shopify_client.get_inventory_levels(
             inventory_item_ids=[92000001],
-            location_ids=[70000001],
+            location_ids=[70000002],
         )
         initial_qty = initial_inv[0]["available"]
 
@@ -251,13 +255,13 @@ class TestCliEndToEnd(unittest.TestCase):
         self.assertEqual(len(refunds), 1)
         refund = refunds[0]
         self.assertEqual(refund.status.value, "COMPLETED")
-        self.assertEqual(refund.credit_note_no, "ELU/HSR/FY26/CN/00001")
+        self.assertEqual(refund.credit_note_no, f"ELU/HSR/{fy}/CN/00001")
         self.assertEqual(refund.amount_paise, inv.net_paise)
 
         # 5. Verify frame inventory incremented by exactly 1
         updated_inv = self.shopify_client.get_inventory_levels(
             inventory_item_ids=[92000001],
-            location_ids=[70000001],
+            location_ids=[70000002],
         )
         updated_qty = updated_inv[0]["available"]
         self.assertEqual(updated_qty, initial_qty + 1)
@@ -278,7 +282,8 @@ class TestCliEndToEnd(unittest.TestCase):
             lens_variant_id=91000041,
             auto_confirm=True,
         )
-        inv = self.repo.get_invoice("ELU/HSR/FY26/00001")
+        fy = get_financial_year()
+        inv = self.repo.get_invoice(f"ELU/HSR/{fy}/00001")
 
         # 2. Refund the sale
         run_refund(
@@ -295,7 +300,7 @@ class TestCliEndToEnd(unittest.TestCase):
         self.assertEqual(ret, 0)
 
         # 4. Verify report domain model calculation
-        report = self.day_end_service.generate_report("HSR", 70000001, today_str)
+        report = self.day_end_service.generate_report("HSR", 70000002, today_str)
         self.assertEqual(report.posted_sales_count, 1)
         self.assertEqual(report.refunds_count, 1)
         self.assertEqual(report.gross_sales_paise, inv.gross_paise)
