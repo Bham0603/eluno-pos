@@ -470,7 +470,8 @@ class TestMockServerIntegration(unittest.TestCase):
         self.assertEqual(report.refunds_count, 1)
         self.assertEqual(report.refunds_amount_paise, checkout_result.net_payable_paise)
         self.assertEqual(report.net_sales_after_refunds_paise, 0)
-        self.assertEqual(len(report.discrepancies), 0)
+        self.assertFalse(report.is_reconciled)
+        self.assertTrue(any("reconciliation skipped" in d.lower() for d in report.discrepancies))
 
         temp_dir.cleanup()
 

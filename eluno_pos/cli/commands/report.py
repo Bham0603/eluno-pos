@@ -119,18 +119,32 @@ def run_report(
     print_table(hsn_headers, hsn_rows)
 
     # 5. Operational Audit Metrics
+    if not report.is_reconciled:
+        if any("reconciliation skipped" in d.lower() for d in report.discrepancies):
+            sync_label = "SKIPPED (Local SQLite ledger only)"
+        else:
+            sync_label = "DISCREPANCIES FLAGGED"
+    else:
+        sync_label = "RECONCILED (100% matched)"
+
     op_items = [
         ("Cancelled Invoices", f"{report.cancelled_invoices_count} (Pre-payment abandoned)"),
         ("Pending Reconciliations", f"{report.pending_reconciliation_count} items"),
-        ("Shopify Cloud Sync", "RECONCILED (100% matched)" if report.is_reconciled else "DISCREPANCIES FLAGGED"),
+        ("Shopify Cloud Sync", sync_label),
     ]
     print_card("Operational Audit & Cloud Synchronization", op_items)
 
     if not report.is_reconciled and report.discrepancies:
-        print("\n⚠ Cloud Discrepancy Alerts:")
-        for disc in report.discrepancies:
-            print(f"  • {disc}")
-        print()
+        if any("reconciliation skipped" in d.lower() for d in report.discrepancies):
+            print("\nℹ Reconciliation Notice:")
+            for disc in report.discrepancies:
+                print(f"  • {disc}")
+            print()
+        else:
+            print("\n⚠ Cloud Discrepancy Alerts:")
+            for disc in report.discrepancies:
+                print(f"  • {disc}")
+            print()
 
     print("✔ Day-end report successfully generated.\n")
     return 0

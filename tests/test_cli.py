@@ -1018,6 +1018,30 @@ class TestCli(unittest.TestCase):
         self.assertEqual(len(refunds_ok), 1)
         self.assertEqual(refunds_ok[0].status.value, "COMPLETED")
 
+    def test_report_command_with_no_reconcile_flag(self) -> None:
+        """Requirement 4: When --no-reconcile is passed, CLI displays skipped reconciliation rather than 'RECONCILED (100% matched)'."""
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations):
+
+            ret = run_report(
+                ctx=self.ctx,
+                store_code="HSR",
+                business_date="2026-10-20",
+                location_id=70000002,
+                reconcile_shopify=False,
+            )
+
+        self.assertEqual(ret, 0)
+        output = captured.getvalue()
+        # Ensure it does NOT say "RECONCILED (100% matched)"
+        self.assertNotIn("RECONCILED (100% matched)", output)
+        self.assertIn("SKIPPED (Local SQLite ledger only)", output)
+        self.assertIn("Reconciliation Notice:", output)
+        self.assertIn("Shopify reconciliation skipped; figures are based on the local SQLite ledger.", output)
+
 
 if __name__ == "__main__":
     unittest.main()

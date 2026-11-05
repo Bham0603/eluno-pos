@@ -82,9 +82,15 @@ class DayEndReportService:
             status="any",
             limit=250,
         )
-        order_dict = {o["id"]: o for o in orders if "id" in o}
+        order_dict: Dict[int, Dict[str, Any]] = {}
+        for o in orders:
+            if "id" in o:
+                try:
+                    order_dict[int(o["id"])] = o
+                except (ValueError, TypeError):
+                    pass
 
-        # Check if local SQLite has completed refunds for this store & date referencing an order not in order_dict
+        # Check if local SQLite has completed refunds for this store referencing an order not in order_dict
         try:
             with self.repo._get_connection() as conn:
                 cur = conn.execute(
@@ -96,13 +102,18 @@ class DayEndReportService:
                     (store_code, RefundStatus.COMPLETED.value),
                 )
                 for (order_id,) in cur.fetchall():
-                    if order_id and order_id not in order_dict:
+                    if order_id:
                         try:
-                            fetched_order = self.shopify_client.get_order(order_id)
-                            if fetched_order and "id" in fetched_order:
-                                order_dict[fetched_order["id"]] = fetched_order
-                        except Exception:
-                            pass
+                            oid = int(order_id)
+                        except (ValueError, TypeError):
+                            continue
+                        if oid not in order_dict:
+                            try:
+                                fetched_order = self.shopify_client.get_order(oid)
+                                if fetched_order and "id" in fetched_order:
+                                    order_dict[int(fetched_order["id"])] = fetched_order
+                            except Exception:
+                                pass
         except Exception:
             pass
 
@@ -130,9 +141,9 @@ class DayEndReportService:
             # Must not be cancelled
             if o.get("cancelled_at"):
                 continue
-            # Must represent a paid sale (not pending, voided or unpaid)
-            fin_status = str(o.get("financial_status", "")).lower()
-            if fin_status in ("pending", "voided", "unpaid"):
+            # Strict paid-order eligibility positive allowlist: count only paid, partially_refunded, refunded
+            fin_status = str(o.get("financial_status", "")).strip().lower()
+            if fin_status not in ("paid", "partially_refunded", "refunded"):
                 continue
 
             sales_orders.append(o)
@@ -146,6 +157,7 @@ class DayEndReportService:
         sales_sgst_paise = 0
         sales_total_gst_paise = 0
 
+        quality_discrepancies: List[str] = []
         hsn_data: Dict[str, Dict[str, int]] = {}
 
         def _ensure_hsn(h: str):
@@ -165,6 +177,7 @@ class DayEndReportService:
         channel_totals: Dict[str, int] = {}
 
         for o in sales_orders:
+            order_id_str = str(o.get("id", "UNKNOWN_ORDER"))
             order_subtotal = self._parse_money(o.get("subtotal_price"))
             order_discounts = self._parse_money(o.get("total_discounts"))
             order_net = self._parse_money(o.get("total_price"))
@@ -204,6 +217,7 @@ class DayEndReportService:
 
             if line_items:
                 for li in line_items:
+                    line_id_str = str(li.get("id") or li.get("variant_id") or "UNKNOWN_LINE")
                     qty = int(li.get("quantity", 1))
                     price_paise = self._parse_money(li.get("price"))
                     li_gross = price_paise * qty
@@ -211,23 +225,37 @@ class DayEndReportService:
                     li_net = li_gross - li_discount
                     order_line_gross_sum += li_gross
 
-                    # Extract HSN from properties
-                    hsn = "90031900"
+                    # Extract HSN from properties - never silently assume an unknown line is a frame
+                    hsn = None
                     for prop in li.get("properties", []):
                         if prop.get("name") == "hsn" and prop.get("value"):
-                            hsn = str(prop["value"]).strip()
+                            val = str(prop["value"]).strip()
+                            if val:
+                                hsn = val
                             break
+
+                    if not hsn:
+                        hsn = "UNKNOWN"
+                        quality_discrepancies.append(
+                            f"Order {order_id_str} line {line_id_str}: Missing or invalid HSN metadata; recorded under 'UNKNOWN'."
+                        )
                     _ensure_hsn(hsn)
 
                     # Extract CGST and SGST from tax_lines
                     tax_lines = li.get("tax_lines", [])
+                    has_cgst = any(tl.get("title") == "CGST" for tl in tax_lines)
+                    has_sgst = any(tl.get("title") == "SGST" for tl in tax_lines)
                     li_cgst = sum(self._parse_money(tl.get("price")) for tl in tax_lines if tl.get("title") == "CGST")
                     li_sgst = sum(self._parse_money(tl.get("price")) for tl in tax_lines if tl.get("title") == "SGST")
                     li_tot_tax = sum(self._parse_money(tl.get("price")) for tl in tax_lines)
 
-                    if li_tot_tax > 0 and li_cgst == 0 and li_sgst == 0:
-                        li_cgst = round_half_up(Decimal(li_tot_tax) / Decimal("2"))
-                        li_sgst = li_tot_tax - li_cgst
+                    if not (has_cgst and has_sgst):
+                        quality_discrepancies.append(
+                            f"Order {order_id_str} line {line_id_str}: Incomplete tax data; missing explicit CGST/SGST breakdown in tax_lines."
+                        )
+                        # Do not guess CGST/SGST splits when missing; identify incomplete tax data explicitly
+                        li_cgst = 0
+                        li_sgst = 0
 
                     li_taxable = li_net - li_tot_tax
                     order_line_taxable_sum += li_taxable
@@ -248,17 +276,19 @@ class DayEndReportService:
                 sales_sgst_paise += order_line_sgst_sum
                 sales_total_gst_paise += order_line_tot_tax_sum
             else:
+                quality_discrepancies.append(
+                    f"Order {order_id_str}: Missing line_items; HSN and statutory tax breakdown could not be determined."
+                )
                 gross_sales_paise += order_subtotal if order_subtotal > 0 else order_net
                 total_discounts_paise += order_discounts
                 net_sales_paise += order_net
                 ord_tax = self._parse_money(o.get("total_tax"))
                 sales_total_gst_paise += ord_tax
-                cgst = round_half_up(Decimal(ord_tax) / Decimal("2"))
-                sgst = ord_tax - cgst
-                sales_cgst_paise += cgst
-                sales_sgst_paise += sgst
                 taxable = order_net - ord_tax
                 sales_taxable_value_paise += taxable
+                _ensure_hsn("UNKNOWN")
+                hsn_data["UNKNOWN"]["sales_taxable_paise"] += taxable
+                hsn_data["UNKNOWN"]["sales_total_gst_paise"] += ord_tax
 
             # Payment method and channel from note_attributes or transactions
             attrs = {a.get("name"): a.get("value") for a in o.get("note_attributes", []) if isinstance(a, dict)}
@@ -307,15 +337,17 @@ class DayEndReportService:
 
                 refunds_amount_paise += ref_amt
 
+                order_id_str = str(o.get("id", "UNKNOWN_ORDER"))
                 order_lines_by_id = {li.get("id"): li for li in o.get("line_items", [])}
                 refund_line_items = ref.get("refund_line_items", [])
 
                 if refund_line_items:
                     for rl in refund_line_items:
                         li_id = rl.get("line_item_id")
+                        line_id_str = str(li_id or "UNKNOWN_LINE")
                         orig_li = order_lines_by_id.get(li_id)
 
-                        hsn = "90031900"
+                        hsn = None
                         orig_tax_lines = []
                         orig_qty = 1
                         if orig_li:
@@ -323,18 +355,27 @@ class DayEndReportService:
                             orig_tax_lines = orig_li.get("tax_lines", [])
                             for prop in orig_li.get("properties", []):
                                 if prop.get("name") == "hsn" and prop.get("value"):
-                                    hsn = str(prop["value"]).strip()
+                                    val = str(prop["value"]).strip()
+                                    if val:
+                                        hsn = val
                                     break
+                        if not hsn:
+                            hsn = "UNKNOWN"
+                            quality_discrepancies.append(
+                                f"Order {order_id_str} refund line {line_id_str}: Missing or invalid HSN metadata; recorded under 'UNKNOWN'."
+                            )
                         _ensure_hsn(hsn)
 
                         rl_taxable = self._parse_money(rl.get("subtotal"))
                         rl_tot_tax = self._parse_money(rl.get("total_tax"))
                         ref_qty = int(rl.get("quantity", 1))
 
+                        has_orig_cgst = any(tl.get("title") == "CGST" for tl in orig_tax_lines)
+                        has_orig_sgst = any(tl.get("title") == "SGST" for tl in orig_tax_lines)
                         orig_cgst = sum(self._parse_money(tl.get("price")) for tl in orig_tax_lines if tl.get("title") == "CGST")
                         orig_sgst = sum(self._parse_money(tl.get("price")) for tl in orig_tax_lines if tl.get("title") == "SGST")
 
-                        if orig_cgst > 0 or orig_sgst > 0:
+                        if has_orig_cgst and has_orig_sgst and (orig_cgst > 0 or orig_sgst > 0):
                             if ref_qty == orig_qty:
                                 rl_cgst = orig_cgst
                                 rl_sgst = orig_sgst
@@ -342,8 +383,13 @@ class DayEndReportService:
                                 rl_cgst = (orig_cgst * ref_qty) // orig_qty
                                 rl_sgst = rl_tot_tax - rl_cgst
                         else:
-                            rl_cgst = round_half_up(Decimal(rl_tot_tax) / Decimal("2"))
-                            rl_sgst = rl_tot_tax - rl_cgst
+                            # Do not guess CGST/SGST splits when missing; identify incomplete tax data explicitly
+                            if rl_tot_tax > 0:
+                                quality_discrepancies.append(
+                                    f"Order {order_id_str} refund line {line_id_str}: Incomplete tax data; missing original CGST/SGST breakdown."
+                                )
+                            rl_cgst = 0
+                            rl_sgst = 0
 
                         refund_taxable_value_paise += rl_taxable
                         refund_cgst_paise += rl_cgst
@@ -426,6 +472,7 @@ class DayEndReportService:
             "payment_method_totals": payment_method_totals,
             "channel_totals": channel_totals,
             "hsn_totals": hsn_breakdowns,
+            "quality_discrepancies": quality_discrepancies,
         }
 
     def _compute_from_local(
@@ -686,9 +733,9 @@ class DayEndReportService:
             try:
                 shopify_data = self._compute_from_shopify(store_code, location_id, business_date)
 
-                # Bidirectional Reconciliation against Local SQLite
-                is_reconciled = True
-                discrepancies: List[str] = []
+                # Initialize discrepancies with data quality discrepancies (if any)
+                discrepancies: List[str] = list(shopify_data.get("quality_discrepancies", []))
+                is_reconciled = (len(discrepancies) == 0)
 
                 if shopify_data["posted_sales_count"] != local_data["posted_sales_count"]:
                     is_reconciled = False
@@ -767,8 +814,10 @@ class DayEndReportService:
                 )
 
         # 3. Cloud Sync Disabled (reconcile_with_shopify=False)
-        local_data["is_reconciled"] = True
-        local_data["discrepancies"] = []
+        local_data["is_reconciled"] = False
+        local_data["discrepancies"] = [
+            "Shopify reconciliation skipped; figures are based on the local SQLite ledger."
+        ]
         return self._build_report_from_data(
             store_code=store_code,
             location_id=location_id,

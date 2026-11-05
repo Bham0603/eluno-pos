@@ -983,6 +983,7 @@ class TestDayEndReportService(unittest.TestCase):
                         "price": "10000.00",
                         "quantity": 1,
                         "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
                         "tax_lines": [{"title": "CGST", "price": "762.71"}, {"title": "SGST", "price": "762.71"}],
                     }
                 ],
@@ -1172,6 +1173,330 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertEqual(hsn_lens.sales_cgst_paise, 2379)
         self.assertEqual(hsn_lens.sales_sgst_paise, 2378)
         self.assertEqual(hsn_lens.sales_total_gst_paise, 4757)
+
+    def test_strict_paid_order_eligibility_positive_allowlist(self) -> None:
+        """Requirement 1: Strict positive allowlist for paid-order eligibility.
+        Counts only 'paid', 'partially_refunded', and 'refunded'.
+        Excludes 'partially_paid', 'authorized', 'pending', 'voided', 'unpaid', cancelled, and unknown statuses.
+        """
+        business_date = "2026-10-20"
+
+        candidate_statuses = [
+            ("paid", True),
+            ("partially_refunded", True),
+            ("refunded", True),
+            ("partially_paid", False),
+            ("authorized", False),
+            ("pending", False),
+            ("voided", False),
+            ("unpaid", False),
+            ("unknown_financial_status", False),
+        ]
+
+        mock_orders = []
+        for idx, (status_val, is_allowed) in enumerate(candidate_statuses, start=1):
+            mock_orders.append({
+                "id": 95001000 + idx,
+                "location_id": 70000002,
+                "financial_status": status_val,
+                "subtotal_price": "1000.00",
+                "total_discounts": "0.00",
+                "total_price": "1000.00",
+                "created_at": f"{business_date}T10:{idx:02d}:00+05:30",
+                "cancelled_at": None,
+                "line_items": [
+                    {
+                        "id": 96001000 + idx,
+                        "price": "1000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [{"title": "CGST", "price": "76.27"}, {"title": "SGST", "price": "76.27"}],
+                    }
+                ],
+                "refunds": [],
+            })
+
+        # Also add a cancelled order with 'paid' status (must be excluded)
+        mock_orders.append({
+            "id": 95001999,
+            "location_id": 70000002,
+            "financial_status": "paid",
+            "subtotal_price": "1000.00",
+            "total_discounts": "0.00",
+            "total_price": "1000.00",
+            "created_at": f"{business_date}T11:00:00+05:30",
+            "cancelled_at": f"{business_date}T11:05:00+05:30",
+            "line_items": [
+                {
+                    "id": 96001999,
+                    "price": "1000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [{"title": "CGST", "price": "76.27"}, {"title": "SGST", "price": "76.27"}],
+                }
+            ],
+            "refunds": [],
+        })
+
+        self.mock_shopify.get_orders.return_value = mock_orders
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Exactly 3 orders (paid, partially_refunded, refunded) are counted as sales
+        self.assertEqual(report.posted_sales_count, 3)
+        self.assertEqual(report.gross_sales_paise, 300000)
+        self.assertEqual(report.net_sales_paise, 300000)
+
+    def test_missing_hsn_and_incomplete_tax_metadata_flagged_as_quality_discrepancy(self) -> None:
+        """Requirement 2: Remove silent HSN default; do not classify unknown line as frame; do not guess CGST/SGST splits."""
+        business_date = "2026-10-20"
+
+        order_id = 95002001
+        line_id = 96002001
+
+        # Lens line with MISSING HSN property and MISSING CGST/SGST breakdown (single 'Tax' line)
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "LN-TEST-01",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "line_type", "value": "lens"}],  # No HSN!
+                        "tax_lines": [{"title": "TotalTax", "price": "238.10"}],  # Missing explicit CGST and SGST!
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Available financial totals are preserved
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.net_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 23810)
+
+        # 2. Never assume an unknown line is a frame (HSN 90031900)
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+
+        # 3. CGST/SGST splits are NOT guessed when metadata is incomplete
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+
+        # 4. Report marked with data-quality discrepancies containing order and line identifiers
+        self.assertFalse(report.is_reconciled)
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn(str(line_id), discrepancy_text)
+        self.assertTrue(any("HSN metadata" in d for d in report.discrepancies))
+        self.assertTrue(any("CGST/SGST breakdown" in d for d in report.discrepancies))
+
+    def test_historical_refund_discovery_via_get_order_lookup(self) -> None:
+        """Requirement 3: Exercise actual _fetch_shopify_orders_for_store() historical order lookup path.
+        - Initial get_orders() does NOT contain older parent order.
+        - SQLite has completed refund record referencing older Shopify order ID.
+        - get_order(order_id) returns older order containing refund on business_date.
+        - Refund is included exactly once; original sale is NOT counted on refund date.
+        """
+        business_date = "2026-10-25"
+        older_sale_date = "2026-10-01"
+        older_order_id = 99000888
+        refund_id_num = 88000888
+
+        # 1. Store a posted invoice and completed refund in SQLite referencing older Shopify order
+        inv = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY27",
+            checkout_ref="chk_hist_test",
+            customer_id=80001001,
+            gross_paise=1000000,
+            discount_paise=0,
+            net_paise=1000000,
+            taxable_paise=847458,
+            tax_paise=152542,
+            lines=[self._create_line("L_HIST", "frame", 1000000, "90031900", 847458, 76271, 76271, 152542)],
+        )
+        self.repo.update_invoice_payment(inv.invoice_no, "chg_hist_test")
+        self.repo.update_invoice_shopify_order(inv.invoice_no, older_order_id, InvoiceStatus.POSTED)
+
+        refund_record = RefundRecord(
+            refund_id="ref_hist_uuid_01",
+            credit_note_no="ELU/HSR/FY27/CN/00888",
+            invoice_no=inv.invoice_no,
+            checkout_ref=inv.checkout_ref,
+            charge_id="chg_hist_test",
+            shopify_order_id=older_order_id,
+            amount_paise=1000000,
+            status=RefundStatus.COMPLETED,
+            reason_code="CUSTOMER_RETURN",
+            terminal_refund_id="trf_hist_01",
+            shopify_refund_id=refund_id_num,
+            created_at=f"{business_date}T14:00:00+05:30",
+        )
+        self.repo.record_refund_intent(refund_record)
+        self.repo.update_refund_completed(refund_record.refund_id, refund_id_num)
+
+        with self.repo._get_connection() as conn:
+            conn.execute("UPDATE invoices SET created_at = ? WHERE invoice_no = ?;", (f"{older_sale_date}T10:00:00+05:30", inv.invoice_no))
+            conn.execute("UPDATE refunds SET created_at = ? WHERE refund_id = ?;", (f"{business_date}T14:00:00+05:30", refund_record.refund_id))
+
+        # 2. Mock Shopify: get_orders() does NOT contain older_order_id!
+        # It only contains a new sale placed today on 2026-10-25
+        today_order = {
+            "id": 95003001,
+            "location_id": 70000002,
+            "financial_status": "paid",
+            "subtotal_price": "5000.00",
+            "total_discounts": "0.00",
+            "total_price": "5000.00",
+            "created_at": f"{business_date}T11:00:00+05:30",
+            "line_items": [
+                {
+                    "id": 96003001,
+                    "price": "5000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90015000"}],
+                    "tax_lines": [{"title": "CGST", "price": "119.05"}, {"title": "SGST", "price": "119.05"}],
+                }
+            ],
+            "refunds": [],
+        }
+        self.mock_shopify.get_orders.return_value = [today_order]
+
+        # 3. get_order(older_order_id) returns older order containing refund dated on business_date
+        older_order_payload = {
+            "id": older_order_id,
+            "location_id": 70000002,
+            "financial_status": "refunded",
+            "subtotal_price": "10000.00",
+            "total_discounts": "0.00",
+            "total_price": "10000.00",
+            "created_at": f"{older_sale_date}T10:00:00+05:30",  # Sold weeks ago!
+            "line_items": [
+                {
+                    "id": 96000888,
+                    "sku": "FR-0888",
+                    "price": "10000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [{"title": "CGST", "price": "762.71"}, {"title": "SGST", "price": "762.71"}],
+                }
+            ],
+            "refunds": [
+                {
+                    "id": refund_id_num,
+                    "order_id": older_order_id,
+                    "created_at": f"{business_date}T14:00:00+05:30",
+                    "transactions": [
+                        {"kind": "refund", "status": "success", "amount": "10000.00"}
+                    ],
+                    "refund_line_items": [
+                        {
+                            "line_item_id": 96000888,
+                            "quantity": 1,
+                            "subtotal": "8474.58",
+                            "total_tax": "1525.42",
+                        }
+                    ],
+                }
+            ],
+        }
+        self.mock_shopify.get_order.side_effect = lambda oid: older_order_payload if oid == older_order_id else None
+
+        # 4. Generate report for business_date
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Verification:
+        # A. Historical order lookup was triggered via get_order(older_order_id)
+        self.mock_shopify.get_order.assert_called_with(older_order_id)
+
+        # B. Only today's sale is counted as a sale (older order is NOT counted as today's sale)
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.net_sales_paise, 500000)
+
+        # C. The refund from the older order is included exactly once
+        self.assertEqual(report.refunds_count, 1)
+        self.assertEqual(report.refunds_amount_paise, 1000000)
+        self.assertEqual(report.refund_taxable_value_paise, 847458)
+        self.assertEqual(report.refund_total_gst_paise, 152542)
+
+        # D. Net revenue after refund: ₹5,000 - ₹10,000 = -₹5,000
+        self.assertEqual(report.net_sales_after_refunds_paise, -500000)
+
+    def test_no_reconcile_flag_marks_report_unreconciled_with_clear_notice(self) -> None:
+        """Requirement 4: When reconcile_with_shopify=False, use SQLite figures, mark unreconciled, add clear message."""
+        business_date = "2026-10-20"
+
+        inv = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_noreconcile_test",
+            customer_id=80001001,
+            gross_paise=1000000,
+            discount_paise=0,
+            net_paise=1000000,
+            taxable_paise=847458,
+            tax_paise=152542,
+            lines=[self._create_line("L_NR", "frame", 1000000, "90031900", 847458, 76271, 76271, 152542)],
+        )
+        self.repo.update_invoice_payment(inv.invoice_no, "chg_nr_test")
+        self.repo.update_invoice_shopify_order(inv.invoice_no, 95000999, InvoiceStatus.POSTED)
+
+        with self.repo._get_connection() as conn:
+            conn.execute("UPDATE invoices SET created_at = '2026-10-20T10:00:00+05:30';")
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=False,
+        )
+
+        # 1. Figures are based on local SQLite ledger
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 1000000)
+        self.assertEqual(report.net_sales_paise, 1000000)
+
+        # 2. Must NOT be marked reconciled
+        self.assertFalse(report.is_reconciled)
+
+        # 3. Must contain explicit message
+        self.assertEqual(
+            report.discrepancies,
+            ["Shopify reconciliation skipped; figures are based on the local SQLite ledger."]
+        )
 
 
 if __name__ == "__main__":
