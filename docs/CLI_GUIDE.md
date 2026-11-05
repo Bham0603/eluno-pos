@@ -161,58 +161,61 @@ python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 -
 ```
 
 **Options:**
-- `--store`, `-s`: Store code (`MM`, `HSR`, `BR`, `KMG`, `JN`, `IN`, `VC`, `HQ`). Must match an actual location.
-- `--staff`: Operating staff ID (e.g. `S108`). Must match an active staff member associated with the selected store.
+- `--store`, `-s`: Store code (`MM`, `HSR`, `BR`, `KMG`, `JN`, `IN`, `VC`). Must match an active retail store (HQ is a warehouse and excluded).
+- `--staff`: Operating staff ID (e.g. `S108`). Validated against the SMT staff registry and verified to belong to the selected store.
 - `--customer`, `-c`: Customer phone number (e.g. `+919000000001`).
-- `--frame`, `-f`: Shopify Variant ID of the frame (e.g. `91000001`).
-- `--lens`, `-l`: Shopify Variant ID of the ophthalmic lens (e.g. `91000041`).
-- `--rx`, `-r`: Specific clinical prescription ID to link (e.g. `RX5002`). Must belong to the customer and be valid.
-- `--for-member`: Recipient name for family billing.
-- `--for-customer-id`, `--wearer-id`: Persisted customer ID of wearer/recipient.
+- `--frame`, `-f`: Shopify Variant ID of the frame (e.g. `91000001`). Must contain `variant.eluno.hsn` metadata.
+- `--lens`, `-l`: Shopify Variant ID of the ophthalmic lens (e.g. `91000041`). Must contain `variant.eluno.hsn` metadata.
+- `--rx`, `-r`: Specific clinical prescription ID to link (e.g. `RX5002`) or `plano`. Must belong to customer and be valid on transaction date.
+- `--for-member`: Recipient name for family billing (persisted as `wearer_name`).
+- `--for-customer-id`, `--wearer-id`: Persisted integer customer ID of wearer/recipient (kept `None` if unenrolled).
 - `--manager-override`: Manager discount override in basis points (100 bps = 1.00%, max 1000 bps = 10.00%).
 - `--override-reason`: Mandatory reason code for manager override (e.g. `CUSTOMER_RETENTION`, `PRICE_MATCH`).
 - `--override-manager-id`: Staff ID of authorizing store manager (must have `store_manager` override permissions).
 - `--method`, `-m`: Payment method (`upi`, `card`, `cash`). Default: `upi`.
-- `--yes`, `-y`: Run non-interactively, auto-confirming all prompts with safe defaults.
+- `--yes`, `-y`: Run non-interactively. Requires complete, explicit transaction inputs (`--store`, `--staff`, `--customer`, `--frame`, `--lens`); no silent demo defaults are assumed for financial safety, and authorizes the financial operation without interactive confirmation.
 
-**Checkout Lifecycle Stages:**
-1. **Store Selection**: Validates store code against Shopify locations. Rejects invalid stores with valid options.
-2. **Staff Authentication**: Validates staff ID against SMT store staff. Rejects unverified staff.
-3. **Customer Identification**: Pulls profile and tags (`priority`, `family`, `campaign`).
-4. **Prescription Retrieval**: Validates prescription ID, checks expiration date, and hides clinical measurements.
-5. **Family Billing**: Assigns recipient name and binds integer `for_customer_id` for individual wearer tracking.
-6. **Catalogue Selection**: Identifies frame and lens variants; enforces strict HSN metadata presence without guessing.
-7. **Optical Validation (`LensValidator`)**: Checks SPH, CYL, AXIS, and ADD limits. Rejects incompatible geometries before invoicing.
+**Checkout Lifecycle & Safety Invariants:**
+1. **Retail Store Filtering**: Validates store code against active Shopify locations with `eluno.kind="store"`. Excludes HQ (`kind="warehouse"`) and inactive stores.
+2. **Staff Store Association**: Validates operating staff against SMT staff records for the active store. Rejects unverified staff or staff registered to other stores.
+3. **Customer Identification**: Looks up profile by phone and pulls customer tags (`priority`, `family`, `campaign`).
+4. **Prescription Safety & Clinical Privacy**: Conceals raw clinical optical measurements (SPH, CYL, AXIS, ADD, PD) from the operator screen. Displays only governance metadata (Rx ID, test date, optometrist/source, validity status, and reading ADD presence). If all prescriptions on file are expired, checkout rejects in `--yes` mode unless `--rx plano` is explicitly authorized; in interactive mode, staff confirmation is required.
+5. **Family Wearer Identity**: Distinguishes between purchaser, enrolled family member with a customer ID (`for_customer_id`), and unenrolled family member by text name (`wearer_name`). Unenrolled members never map to the purchaser's ID.
+6. **Authoritative HSN Source**: Enforces HSN lookup strictly from `variant.eluno.hsn`. Rejects variants missing documented HSN metadata before invoice allocation.
+7. **Optical Validation (`LensValidator`)**: Checks SPH, CYL, AXIS, and ADD limits against lens geometry.
 8. **Pair Association**: Binds frame and lens under a deterministic `pair_ref` token and persists wearer association.
 9. **Manager Override**: Validates authorized store manager role, audit reason code, and enforces strict 10% cap.
 10. **Promotion Evaluation (`OfferService`)**: Evaluates best savings across product, category, pair, and cart levels.
 11. **Tax Engine (`GstService`)**: Computes exact CGST + SGST per HSN (`90031900` @ 18%, `90015000` @ 5%) with zero paisa drift.
-12. **Staff Confirmation Gate**: Requires explicit operator confirmation before terminal charging.
-13. **Payment Capture (`PaymentService`)**: Dispatches charge to terminal with durable sequence tracking.
-14. **Cloud Order Sync (`ShopifyOrderService`)**: Creates paid Shopify order with minimized metadata (`rx_id`, `pair_ref`, `hsn`, `for_customer_id`).
-15. **Receipt Issuance**: Generates formatted receipt and dispatches order to optical lab.
+12. **Dynamic Financial Year**: Derives invoice financial year dynamically from transaction date using Indian convention (April 1 – March 31, e.g. `FY27` for November 2026).
+13. **Payment Authorization Gate**: Interactive confirmation defaults to `False` (`[y/N]`); pressing Enter cancels payment safely without charging.
+14. **Payment Capture (`PaymentService`)**: Dispatches charge to terminal with durable sequence tracking.
+15. **Cloud Order Sync (`ShopifyOrderService`)**: Creates paid Shopify order with minimized metadata (`rx_id`, `pair_ref`, `hsn`, `for_customer_id`, `wearer_name`).
 
 ---
 
 ### Command 4: `refund` (Store Return & Full Refund)
-Processes a full return of an existing tax invoice, reversing payment on the original terminal charge, issuing a numbered Credit Note, restocking the physical frame at the store, and scrapping custom prescription lenses.
+Processes a full return of an existing tax invoice, reversing payment on the original terminal charge, issuing a sequentially numbered Credit Note, restocking the physical frame at the store, and scrapping custom prescription lenses.
 
 ```bash
-python -m eluno_pos refund --invoice ELU/HSR/FY26/00001 --staff S108 --reason CUSTOMER_RETURN --yes
+python -m eluno_pos refund --invoice ELU/HSR/FY27/00001 --staff S108 --reason CUSTOMER_RETURN --yes
 ```
 
 **Options:**
-- `--invoice`, `-i`: Tax invoice number (e.g. `ELU/HSR/FY26/00001`).
-- `--location`: Shopify store location ID for frame restocking (defaults to original store location).
-- `--reason`: Return reason code (`CUSTOMER_RETURN`, `DEFECTIVE`, `WRONG_POWER`, `FRAME_DAMAGE`). Default: `CUSTOMER_RETURN`.
-- `--staff`: Authorizing staff member ID.
-- `--yes`, `-y`: Run non-interactively, auto-confirming all prompts with safe defaults.
+- `--invoice`, `-i`: Tax invoice number to refund (e.g. `ELU/HSR/FY27/00001`). Required in `--yes` mode.
+- `--location`: Shopify store location ID for frame restocking (defaults to original invoice store location).
+- `--reason`: Return reason code (`CUSTOMER_RETURN`, `DEFECTIVE_FRAME`, `INCORRECT_PRESCRIPTION`). Required in `--yes` mode.
+- `--staff`: Authorizing staff member ID. Required in all modes.
+- `--yes`, `-y`: Run non-interactively with explicit arguments (`--invoice`, `--staff`, `--reason`), bypassing confirmation prompts.
 
-**Refund Invariants:**
+**Refund Staff Authorization & Safety Invariants:**
+- **Strict Staff Verification**: The authorizing staff ID is queried against the SMT registry for the original invoice's `store_code`.
+- **Store Association Enforcement**: Staff belonging to another store or unknown staff IDs are strictly rejected.
+- **Zero Pre-authorization Mutations**: If staff validation fails, zero terminal refund POST calls are made and zero refund intents are allocated in the database.
 - **Atomic Concurrency Safety**: Uses `BEGIN IMMEDIATE` transaction to guarantee concurrent requests cannot double-refund.
-- **Credit Note Sequencing**: Allocates durable credit note `ELU/{store}/{FY}/CN/{seq}` **only after** terminal confirmation.
-- **Frame Restock**: Physical frames are restocked (`restock_type = return`, quantity +1).
-- **Custom Lens Scrapped**: Custom prescription lenses are never restocked (`restock_type = no_restock`).
+- **Sequential Credit Notes**: Allocates durable credit note `ELU/{store}/{FY}/CN/{seq}` **only after** conclusive terminal confirmation.
+- **Physical Frame Restock**: Physical frames are restocked (+1 available at store location).
+- **Custom Lens Scrapped**: Custom ophthalmic lenses are marked `no_restock`.
 - **Audit Preservation**: Original sales invoice remains intact in `POSTED` status; refund is linked in `refunds` ledger.
 
 ---
@@ -225,7 +228,7 @@ python -m eluno_pos report --store HSR --date 2026-11-05
 ```
 
 **Options:**
-- `--store`, `-s`: Store code (`MM`, `HSR`, `BR`, `KMG`, `JN`, `IN`, `VC`, `HQ`).
+- `--store`, `-s`: Store code (`MM`, `HSR`, `BR`, `KMG`, `JN`, `IN`, `VC`).
 - `--date`, `-d`: Business date in `YYYY-MM-DD` format (defaults to today in Asia/Kolkata).
 - `--location`: Store location ID (defaults to store code mapping).
 - `--no-reconcile`: Skip live comparison against Shopify cloud orders.
@@ -251,7 +254,7 @@ python -m eluno_pos reconcile --store HSR
 **Options:**
 - `--store`, `-s`: Filter by store code (optional).
 - `--execute`, `-x`: Execute safe automated reconciliation routines.
-- `--yes`, `-y`: Run non-interactively, auto-confirming all prompts with safe defaults.
+- `--yes`, `-y`: Run non-interactively with safe defaults.
 
 **Recovery Mechanisms:**
 - **Terminal Payment Verification**: Queries payment terminal gateway by actual `charge_id` and checks status (never creates duplicate charges).
@@ -266,7 +269,7 @@ python -m eluno_pos reconcile --store HSR
 Displays the full printable tax invoice document and line item breakdown without exposing sensitive clinical parameters.
 
 ```bash
-python -m eluno_pos invoice show --invoice ELU/HSR/FY26/00001
+python -m eluno_pos invoice show --invoice ELU/HSR/FY27/00001
 ```
 
 **Options:**
@@ -294,19 +297,19 @@ python -m eluno_pos customer lookup --phone +919000000001
 ```bash
 python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 --frame 91000001 --lens 91000041 --yes
 ```
-*Expected: Generates invoice `ELU/HSR/{FY}/00001`, captures payment on terminal, posts order to Shopify, prints receipt.*
+*Expected: Generates invoice `ELU/HSR/FY27/00001`, captures payment on terminal, posts order to Shopify, prints receipt.*
 
 ### Step 4: Inspect Generated Tax Invoice
 ```bash
-python -m eluno_pos invoice show --invoice ELU/HSR/FY26/00001
+python -m eluno_pos invoice show --invoice ELU/HSR/FY27/00001
 ```
 *Expected: Displays invoice with line items, FESTIVE10 discount, exact HSN breakdown (18% and 5%), and payment reference.*
 
 ### Step 5: Full Return & Credit Note Issuance
 ```bash
-python -m eluno_pos refund --invoice ELU/HSR/FY26/00001 --staff S108 --reason CUSTOMER_RETURN --yes
+python -m eluno_pos refund --invoice ELU/HSR/FY27/00001 --staff S108 --reason CUSTOMER_RETURN --yes
 ```
-*Expected: Issues credit note `ELU/HSR/{FY}/CN/00001`, reverses terminal charge, restocks frame, scraps lens.*
+*Expected: Issues credit note `ELU/HSR/FY27/CN/00001`, reverses terminal charge, restocks frame, scraps lens.*
 
 ### Step 6: Generate Day-End Report
 ```bash
@@ -325,6 +328,14 @@ python -m eluno_pos reconcile --store HSR
 ## 4. Optical & Financial Precision Rules
 
 1. **Integer Paise Representation**: All internal monetary values are stored and calculated in integer paise ($1 = 100\text{ paise}$). Conversion to decimal string representation occurs only at API boundaries.
+2. **Deterministic GST Allocation**:
+   - Frames: HSN `90031900` @ 18% ($9\%\text{ CGST} + 9\%\text{ SGST}$).
+   - Lenses: HSN `90015000` @ 5% ($2.5\%\text{ CGST} + 2.5\%\text{ SGST}$).
+   - $\text{Taxable} + \text{CGST} + \text{SGST} = \text{Net Line Amount}$ exactly to the paisa.
+3. **Dynamic Financial Year Derivation**: Indian financial year runs from April 1 to March 31. Financial year tokens (e.g. `FY27` for November 2026) are derived dynamically from the transaction date.
+4. **Clinical Privacy Protection**: Optical parameters (SPH, CYL, AXIS, ADD, PD) are validated inside the POS engine and stored in clinic systems (SMT). Frontline CLI outputs and non-clinical systems (Shopify Admin API) receive only data-minimized references (`rx_id`), never full clinical eye measurements.
+5. **Strict Staff Store Association**: Staff authorization enforces that acting staff members are verified against the SMT registry for the active store. Unknown staff or staff from another store are rejected prior to any financial mutation.
+6. **Explicit Non-Interactive Authorization**: The `--yes` flag requires complete explicit transaction arguments and authorizes operations without interactive prompts. Missing parameters abort immediately without demo-data fallbacks.
 2. **Deterministic GST Allocation**:
    - Frames: HSN `90031900` @ 18% ($9\%\text{ CGST} + 9\%\text{ SGST}$).
    - Lenses: HSN `90015000` @ 5% ($2.5\%\text{ CGST} + 2.5\%\text{ SGST}$).

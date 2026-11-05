@@ -29,9 +29,12 @@ def run_refund(
     # 1. Invoice Number Input
     target_inv = invoice_no
     if not target_inv:
-        target_inv = prompt_input("Enter Invoice Number to Refund (e.g. ELU/HSR/FY26/00001)")
+        if auto_confirm:
+            print("✖ Error: Missing required argument '--invoice' for non-interactive refund.")
+            return 1
+        target_inv = prompt_input("Enter Invoice Number to Refund (e.g. ELU/HSR/FY27/00001)")
 
-    target_inv = target_inv.strip().upper()
+    target_inv = target_inv.strip().upper() if target_inv else ""
     if not target_inv:
         print("✖ Error: Invoice number is required.")
         return 1
@@ -80,11 +83,48 @@ def run_refund(
             return 1
     print(f"✔ Restocking Target: Location ID {target_loc_id} ({invoice.store_code})")
 
-    # 4. Reason Code & Staff Member
+    # 4. Authorizing Staff Verification (Query SMT for invoice's store_code)
+    operator_staff = staff_id
+    if not operator_staff:
+        if auto_confirm:
+            print("✖ Error: Missing required argument '--staff' for non-interactive refund.")
+            return 1
+        else:
+            print(f"\nStaff registered at store {invoice.store_code}:")
+            store_staff = ctx.smt_client.get_staff(store_code=invoice.store_code)
+            for s in store_staff[:5]:
+                print(f"  • {s['staff_id']} — {s['name']} ({s['role']})")
+            operator_staff = prompt_input("Enter Authorizing Staff ID")
+
+    operator_staff = operator_staff.strip() if operator_staff else ""
+    if not operator_staff:
+        print("✖ Error: Authorizing staff ID is required.")
+        return 1
+
+    store_staff = ctx.smt_client.get_staff(store_code=invoice.store_code)
+    matched_staff = next((s for s in store_staff if s["staff_id"] == operator_staff), None)
+    if not matched_staff:
+        # Check if staff exists in general SMT registry
+        all_staff = ctx.smt_client.get_staff()
+        other_store_staff = next((s for s in all_staff if s["staff_id"] == operator_staff), None)
+        if other_store_staff:
+            print(f"✖ Error: Staff '{operator_staff}' is registered at store '{other_store_staff.get('store_code')}', not invoice store '{invoice.store_code}'.")
+        else:
+            print(f"✖ Error: Staff member '{operator_staff}' not found in staff registry.")
+        return 1
+
+    if matched_staff.get("is_active") is False:
+        print(f"✖ Error: Staff member '{operator_staff}' is marked inactive.")
+        return 1
+
+    print(f"✔ Authorizing Staff Verified: {matched_staff['name']} ({matched_staff['role']}) [ID: {matched_staff['staff_id']}]")
+
+    # 5. Reason Code Input
     reason = reason_code
     if not reason:
         if auto_confirm:
-            reason = "CUSTOMER_RETURN"
+            print("✖ Error: Missing required argument '--reason' for non-interactive refund.")
+            return 1
         else:
             print("\nCommon Return Reasons:")
             print("  • CUSTOMER_RETURN — Customer changed mind / returned unworn")
@@ -92,14 +132,12 @@ def run_refund(
             print("  • INCORRECT_PRESCRIPTION — Power change / doctor error")
             reason = prompt_input("Enter Return Reason Code", default="CUSTOMER_RETURN").upper()
 
-    operator_staff = staff_id
-    if not operator_staff:
-        if auto_confirm:
-            operator_staff = "STF-01"
-        else:
-            operator_staff = prompt_input("Enter Authorizing Staff ID", default="STF-01")
+    reason = reason.strip().upper() if reason else ""
+    if not reason:
+        print("✖ Error: Return reason code is required.")
+        return 1
 
-    # 5. Explicit Staff Confirmation Gate
+    # 6. Explicit Staff Confirmation Gate
     print(f"\nRefund Summary: Reversing {format_inr(remaining_refundable)} to customer's original payment method.")
     if not auto_confirm:
         confirmed = prompt_confirm(f"Authorize full refund of {format_inr(remaining_refundable)} and issue Credit Note?", default=False)
@@ -107,7 +145,7 @@ def run_refund(
             print("\n✖ Refund aborted by staff. No money was reversed and no records were updated.\n")
             return 0
 
-    # 6. Execute Refund via RefundService
+    # 7. Execute Refund via RefundService
     print("\nProcessing terminal reversal and cloud inventory reconciliation...")
     try:
         result = ctx.refund_service.process_full_refund(

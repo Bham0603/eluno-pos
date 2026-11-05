@@ -60,11 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 4. REFUND: Full return & credit note issuance
     refund_p = subparsers.add_parser("refund", help="Process full return, terminal reversal, and credit note issuance.")
-    refund_p.add_argument("-i", "--invoice", help="Invoice number to refund (e.g. ELU/HSR/FY26/00001).")
+    refund_p.add_argument("-i", "--invoice", help="Invoice number to refund (e.g. ELU/HSR/FY27/00001).")
     refund_p.add_argument("--location", type=int, help="Store location ID for frame restocking.")
-    refund_p.add_argument("--reason", default="CUSTOMER_RETURN", help="Return reason code (default: CUSTOMER_RETURN).")
-    refund_p.add_argument("--staff", help="Authorizing staff ID.")
-    refund_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, auto-confirming all prompts with safe defaults.")
+    refund_p.add_argument("--reason", help="Return reason code (e.g. CUSTOMER_RETURN, DEFECTIVE_FRAME).")
+    refund_p.add_argument("--staff", help="Authorizing staff ID (must belong to invoice store).")
+    refund_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively with explicit arguments, bypassing confirmation prompts.")
 
     # 5. REPORT: Day-end store report
     report_p = subparsers.add_parser("report", help="Generate consolidated day-end sales, refund, and GST report.")
