@@ -423,6 +423,171 @@ class TestRefundService(unittest.TestCase):
         # Terminal refund was called exactly once! Never duplicated!
         self.assertEqual(self.mock_terminal_client.create_refund.call_count, 1)
 
+    def test_terminal_refund_read_after_write_lag_keeps_pending_without_duplicate(self) -> None:
+        """Requirement 1: Do not mark ambiguous refund FAILED when immediate GET response
+        has not yet reflected the refund. Keep pending and prove recovery cannot double-refund.
+        """
+        # Baseline check: 0 refunded
+        # Immediate check after timeout: still 0 (read-after-write lag on gateway!)
+        # Subsequent check during recovery: 1949700 (now visible)
+        self.mock_terminal_client.get_charge.side_effect = [
+            {"charge_id": "chg_unit_refund_01", "amount_paise": 1949700, "refunded_paise": 0},  # Pre-POST baseline
+            {"charge_id": "chg_unit_refund_01", "amount_paise": 1949700, "refunded_paise": 0},  # Immediate GET: lag
+            {"charge_id": "chg_unit_refund_01", "amount_paise": 1949700, "refunded_paise": 0},  # First recovery attempt: still lagging
+            {"charge_id": "chg_unit_refund_01", "amount_paise": 1949700, "refunded_paise": 1949700},  # Second recovery: reflected!
+        ]
+        self.mock_terminal_client.create_refund.side_effect = AmbiguousOperationError("Network timeout during POST")
+        self.mock_shopify_client.create_refund.return_value = {"id": 98000999}
+
+        # 1. Attempt refund: encounters ambiguous timeout, immediate GET shows unchanged baseline
+        res = self.service.process_full_refund(
+            invoice_no=self.invoice.invoice_no,
+            location_id=70000002,
+        )
+
+        # Inconclusive: MUST NOT be marked FAILED! Must remain PENDING_RECONCILIATION
+        self.assertFalse(res.success)
+        self.assertEqual(res.status, RefundStatus.PENDING_RECONCILIATION)
+
+        # Verify baseline was durably stored in SQLite before the POST
+        stored_refund = self.repo.get_refund(res.refund_id)
+        self.assertEqual(stored_refund.baseline_refunded_paise, 0)
+        self.assertEqual(stored_refund.status, RefundStatus.PENDING_RECONCILIATION)
+        self.assertIsNone(stored_refund.credit_note_no)
+
+        # 2. Attempt recovery while gateway read-after-write is still lagging
+        rec_pending = self.service.resume_or_reconcile_refund(
+            refund_id=res.refund_id,
+            location_id=70000002,
+        )
+        self.assertIsNotNone(rec_pending)
+        self.assertFalse(rec_pending.success)
+        self.assertEqual(rec_pending.status, RefundStatus.PENDING_RECONCILIATION)
+        # Verify no second refund POST was made!
+        self.assertEqual(self.mock_terminal_client.create_refund.call_count, 1)
+
+        # 3. Second recovery attempt: gateway has now committed and updated refunded_paise
+        rec_success = self.service.resume_or_reconcile_refund(
+            refund_id=res.refund_id,
+            location_id=70000002,
+        )
+        self.assertIsNotNone(rec_success)
+        self.assertTrue(rec_success.success)
+        self.assertEqual(rec_success.status, RefundStatus.COMPLETED)
+        self.assertIsNotNone(rec_success.credit_note_no)
+        self.assertEqual(rec_success.shopify_refund_id, 98000999)
+
+        # Verify create_refund was called exactly ONCE across the entire lifecycle
+        self.assertEqual(self.mock_terminal_client.create_refund.call_count, 1)
+
+    def test_restocking_recovery_failure_injection(self) -> None:
+        """Requirement 3: Restocking recovery test.
+        - Create a successful full refund.
+        - Allow Shopify to process refund and frame restocking.
+        - Simulate loss of the Shopify response or application restart.
+        - Resume reconciliation.
+        - Confirm existing Shopify refund by credit note reference.
+        - Confirm no second Shopify refund is submitted.
+        - Confirm frame inventory increases exactly once.
+        - Confirm lens inventory does not increase.
+        """
+        self.mock_terminal_client.get_charge.return_value = {
+            "charge_id": "chg_unit_refund_01",
+            "amount_paise": 1949700,
+            "refunded_paise": 0,
+        }
+        self.mock_terminal_client.create_refund.return_value = {
+            "refund_id": "trf_captured_restock_01",
+            "amount_paise": 1949700,
+        }
+
+        # Track inventory adjustments and Shopify refund submissions
+        inventory_adjustments = []
+        shopify_refund_calls = []
+
+        def fake_create_refund(order_id: int, refund_data: dict) -> dict:
+            shopify_refund_calls.append((order_id, refund_data))
+            # Simulate Shopify server processing:
+            # 1. Update line item restock in Shopify
+            for item in refund_data.get("refund_line_items", []):
+                if item.get("restock_type") == "return":
+                    inventory_adjustments.append({
+                        "line_item_id": item["line_item_id"],
+                        "location_id": item.get("location_id"),
+                        "quantity": item["quantity"],
+                        "restock_type": "return",
+                    })
+                elif item.get("restock_type") == "no_restock":
+                    # Lens is never restocked!
+                    pass
+
+            # 2. Add refund to order on Shopify
+            created_refund_record = {
+                "id": 98000888,
+                "order_id": order_id,
+                "note_attributes": refund_data.get("note_attributes", []),
+                "note": refund_data.get("note", ""),
+                "refund_line_items": refund_data.get("refund_line_items", []),
+            }
+            self.mock_shopify_order["refunds"].append(created_refund_record)
+
+            # 3. Simulate network loss on response back to POS client
+            raise AmbiguousOperationError("Connection reset by peer after Shopify committed refund")
+
+        self.mock_shopify_client.create_refund.side_effect = fake_create_refund
+
+        # 1. Process refund: terminal succeeds, credit note allocated, Shopify commits but connection drops
+        res = self.service.process_full_refund(
+            invoice_no=self.invoice.invoice_no,
+            location_id=70000002,
+        )
+
+        self.assertFalse(res.success)
+        self.assertEqual(res.status, RefundStatus.PENDING_RECONCILIATION)
+        self.assertEqual(res.terminal_refund_id, "trf_captured_restock_01")
+        self.assertIsNotNone(res.credit_note_no)
+
+        # Verify Shopify was called once and restocked frame once so far
+        self.assertEqual(len(shopify_refund_calls), 1)
+        self.assertEqual(len(inventory_adjustments), 1)
+        self.assertEqual(inventory_adjustments[0]["quantity"], 1)
+
+        # 2. Simulate application restart
+        restarted_repo = InvoiceRepository(self.db_path)
+        restarted_shopify = MagicMock(spec=ShopifyClient)
+        # On restarted client, get_order returns the order with the committed refund
+        restarted_shopify.get_order.return_value = self.mock_shopify_order
+        restarted_service = RefundService(
+            terminal_client=self.mock_terminal_client,
+            shopify_client=restarted_shopify,
+            invoice_repository=restarted_repo,
+        )
+
+        # 3. Resume reconciliation
+        rec_res = restarted_service.resume_or_reconcile_refund(
+            refund_id=res.refund_id,
+            location_id=70000002,
+        )
+
+        # 4. Confirmations
+        self.assertIsNotNone(rec_res)
+        self.assertTrue(rec_res.success)
+        self.assertEqual(rec_res.status, RefundStatus.COMPLETED)
+        self.assertEqual(rec_res.shopify_refund_id, 98000888)
+        self.assertEqual(rec_res.credit_note_no, res.credit_note_no)
+
+        # Confirm no second Shopify refund is submitted
+        restarted_shopify.create_refund.assert_not_called()
+        self.assertEqual(len(shopify_refund_calls), 1)
+
+        # Confirm frame inventory was restocked exactly once
+        self.assertEqual(len(inventory_adjustments), 1)
+        self.assertEqual(inventory_adjustments[0]["quantity"], 1)
+
+        # Confirm lens inventory was NEVER restocked
+        lens_restocks = [adj for adj in inventory_adjustments if adj.get("restock_type") != "return"]
+        self.assertEqual(len(lens_restocks), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

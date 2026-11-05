@@ -190,6 +190,23 @@ class InvoiceRepository:
                 );
             """)
 
+            # Safe database migration: Ensure existing Phase 4 tables have Phase 5 columns
+            cur = conn.execute("PRAGMA table_info(invoice_lines);")
+            existing_lines_cols = {row["name"] for row in cur.fetchall()}
+            if "taxable_paise" not in existing_lines_cols:
+                conn.execute("ALTER TABLE invoice_lines ADD COLUMN taxable_paise INTEGER NOT NULL DEFAULT 0;")
+            if "cgst_paise" not in existing_lines_cols:
+                conn.execute("ALTER TABLE invoice_lines ADD COLUMN cgst_paise INTEGER NOT NULL DEFAULT 0;")
+            if "sgst_paise" not in existing_lines_cols:
+                conn.execute("ALTER TABLE invoice_lines ADD COLUMN sgst_paise INTEGER NOT NULL DEFAULT 0;")
+            if "tax_paise" not in existing_lines_cols:
+                conn.execute("ALTER TABLE invoice_lines ADD COLUMN tax_paise INTEGER NOT NULL DEFAULT 0;")
+
+            cur = conn.execute("PRAGMA table_info(refunds);")
+            existing_refund_cols = {row["name"] for row in cur.fetchall()}
+            if "baseline_refunded_paise" not in existing_refund_cols:
+                conn.execute("ALTER TABLE refunds ADD COLUMN baseline_refunded_paise INTEGER NOT NULL DEFAULT 0;")
+
     def allocate_invoice(
         self,
         store_code: str,
@@ -861,6 +878,23 @@ class InvoiceRepository:
             created_at=now,
             updated_at=now,
         )
+
+    def update_refund_baseline(
+        self,
+        refund_id: str,
+        baseline_refunded_paise: int,
+    ) -> None:
+        """Durably persist baseline refunded_paise on the refund record before terminal POST."""
+        now = self._now_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE refunds
+                SET baseline_refunded_paise = ?, updated_at = ?
+                WHERE refund_id = ?;
+                """,
+                (baseline_refunded_paise, now, refund_id),
+            )
 
     def update_refund_terminal_captured(
         self,

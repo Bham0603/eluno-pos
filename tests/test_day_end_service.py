@@ -494,6 +494,214 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertGreater(len(report.discrepancies), 0)
         self.assertIn("Bill count mismatch", report.discrepancies[0])
 
+    def test_phase4_database_migration_and_refunded_invoice_retained_in_gross_sales(self) -> None:
+        """Requirement 2: Verify safe Phase 4 SQLite schema migration, consistent invoice enums,
+        and proof that a refunded original invoice remains represented in gross sales with its
+        refund separately deducted.
+        """
+        import sqlite3
+
+        migrated_db = os.path.join(self.temp_dir.name, "phase4_legacy.db")
+
+        # 1. Create a pure Phase 4 legacy SQLite schema without Phase 5 tables or columns
+        raw_conn = sqlite3.connect(migrated_db)
+        raw_conn.execute("""
+            CREATE TABLE invoices (
+                invoice_no TEXT PRIMARY KEY,
+                store_code TEXT NOT NULL,
+                financial_year TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('POSTED', 'PENDING_RECONCILIATION', 'CANCELLED')),
+                customer_id INTEGER,
+                gross_paise INTEGER NOT NULL CHECK (gross_paise >= 0),
+                discount_paise INTEGER NOT NULL CHECK (discount_paise >= 0),
+                net_paise INTEGER NOT NULL CHECK (net_paise >= 0),
+                taxable_paise INTEGER NOT NULL CHECK (taxable_paise >= 0),
+                tax_paise INTEGER NOT NULL CHECK (tax_paise >= 0),
+                checkout_ref TEXT UNIQUE NOT NULL,
+                terminal_charge_id TEXT UNIQUE,
+                shopify_order_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (store_code, financial_year, seq)
+            );
+        """)
+        raw_conn.execute("""
+            CREATE TABLE invoice_lines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_no TEXT NOT NULL,
+                line_id TEXT NOT NULL,
+                line_type TEXT NOT NULL,
+                variant_id INTEGER NOT NULL,
+                sku TEXT NOT NULL,
+                title TEXT NOT NULL,
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                unit_price_paise INTEGER NOT NULL CHECK (unit_price_paise >= 0),
+                gross_paise INTEGER NOT NULL CHECK (gross_paise >= 0),
+                discount_paise INTEGER NOT NULL CHECK (discount_paise >= 0),
+                net_paise INTEGER NOT NULL CHECK (net_paise >= 0),
+                hsn TEXT NOT NULL,
+                pair_ref TEXT,
+                rx_id TEXT,
+                lens_config TEXT,
+                properties_json TEXT,
+                FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
+            );
+        """)
+        raw_conn.execute("""
+            CREATE TABLE invoice_sequences (
+                store_code TEXT NOT NULL,
+                financial_year TEXT NOT NULL,
+                next_seq INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (store_code, financial_year)
+            );
+        """)
+        raw_conn.execute("""
+            CREATE TABLE payment_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                checkout_ref TEXT NOT NULL,
+                invoice_no TEXT NOT NULL,
+                order_ref TEXT UNIQUE NOT NULL,
+                amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+                method TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('INITIATED', 'CAPTURED', 'FAILED', 'UNKNOWN')),
+                charge_id TEXT UNIQUE,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
+            );
+        """)
+        raw_conn.execute("""
+            CREATE TABLE shopify_order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_no TEXT UNIQUE NOT NULL,
+                checkout_ref TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('PENDING', 'COMPLETED', 'AMBIGUOUS', 'RECONCILED')),
+                shopify_order_id INTEGER,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(invoice_no) REFERENCES invoices(invoice_no) ON DELETE RESTRICT
+            );
+        """)
+
+        # Insert a Phase 4 posted sale
+        raw_conn.execute("""
+            INSERT INTO invoices (
+                invoice_no, store_code, financial_year, seq, status,
+                customer_id, gross_paise, discount_paise, net_paise,
+                taxable_paise, tax_paise, checkout_ref, terminal_charge_id,
+                shopify_order_id, created_at, updated_at
+            ) VALUES (
+                'ELU/HSR/FY26/00088', 'HSR', 'FY26', 88, 'POSTED',
+                80001001, 1000000, 0, 1000000, 847458, 152542,
+                'chk_mig_088', 'chg_mig_088', 95000088,
+                '2026-10-25T11:00:00+05:30', '2026-10-25T11:00:00+05:30'
+            );
+        """)
+        raw_conn.execute("""
+            INSERT INTO invoice_lines (
+                invoice_no, line_id, line_type, variant_id, sku, title,
+                quantity, unit_price_paise, gross_paise, discount_paise, net_paise, hsn
+            ) VALUES (
+                'ELU/HSR/FY26/00088', 'L_MIG_1', 'frame', 91000001, 'SKU-FRAME', 'Migrated Frame',
+                1, 1000000, 1000000, 0, 1000000, '90031900'
+            );
+        """)
+        raw_conn.commit()
+        raw_conn.close()
+
+        # 2. Instantiate Phase 5 InvoiceRepository against the Phase 4 database
+        # This triggers automatic safe schema migration in _init_db
+        migrated_repo = InvoiceRepository(migrated_db)
+
+        # Verify new tables and columns now exist and can be queried
+        with migrated_repo._get_connection() as conn:
+            cur = conn.execute("PRAGMA table_info(invoice_lines);")
+            col_names = {row["name"] for row in cur.fetchall()}
+            self.assertIn("taxable_paise", col_names)
+            self.assertIn("cgst_paise", col_names)
+            self.assertIn("sgst_paise", col_names)
+            self.assertIn("tax_paise", col_names)
+
+            # Verify Phase 5 tables were created
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = {row["name"] for row in cur.fetchall()}
+            self.assertIn("credit_note_sequences", tables)
+            self.assertIn("refunds", tables)
+            self.assertIn("restock_intents", tables)
+
+        # 3. Read the migrated invoice
+        migrated_inv = migrated_repo.get_invoice("ELU/HSR/FY26/00088")
+        self.assertIsNotNone(migrated_inv)
+        self.assertEqual(migrated_inv.status, InvoiceStatus.POSTED)
+
+        # 4. Record a full refund for this invoice
+        ref = RefundRecord(
+            refund_id="ref_mig_088",
+            credit_note_no="ELU/HSR/FY26/CN/00008",
+            invoice_no=migrated_inv.invoice_no,
+            checkout_ref=migrated_inv.checkout_ref,
+            charge_id=migrated_inv.terminal_charge_id,
+            shopify_order_id=migrated_inv.shopify_order_id,
+            amount_paise=migrated_inv.net_paise,
+            status=RefundStatus.COMPLETED,
+            reason_code="CUSTOMER_RETURN",
+            staff_id="STF-01",
+            terminal_refund_id="trf_mig_088",
+            shopify_refund_id=98000088,
+            baseline_refunded_paise=0,
+            error_message=None,
+            created_at="2026-10-25T14:00:00+05:30",
+            updated_at="2026-10-25T14:00:00+05:30",
+        )
+        migrated_repo.record_refund_intent(ref)
+        with migrated_repo._get_connection() as conn:
+            conn.execute("UPDATE refunds SET created_at = '2026-10-25T14:00:00+05:30' WHERE refund_id = 'ref_mig_088';")
+
+        # 5. Verify the invoice in invoices table remains POSTED!
+        # Indian GST compliance: Posted tax invoices are immutable. The refund is maintained
+        # separately in the refunds table as a Credit Note.
+        inv_after_refund = migrated_repo.get_invoice(migrated_inv.invoice_no)
+        self.assertEqual(inv_after_refund.status, InvoiceStatus.POSTED)
+
+        # 6. Generate Day-End Report on the date of sale and refund
+        day_end_svc = DayEndReportService(
+            invoice_repository=migrated_repo,
+            shopify_client=self.mock_shopify,
+            gst_service=GstService(),
+        )
+        report = day_end_svc.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date="2026-10-25",
+            reconcile_with_shopify=False,
+        )
+
+        # 7. Verification:
+        # Gross sales contains the original invoice (₹10,000)
+        self.assertEqual(report.gross_sales_paise, 1000000)
+        self.assertEqual(report.posted_sales_count, 1)
+
+        # Refund sales contains the credit note (₹10,000)
+        self.assertEqual(report.refunds_amount_paise, 1000000)
+        self.assertEqual(report.refunds_count, 1)
+
+        # Net sales is ₹0
+        self.assertEqual(report.net_sales_after_refunds_paise, 0)
+        self.assertEqual(report.net_taxable_value_paise, 0)
+        self.assertEqual(report.net_total_gst_paise, 0)
+
+        # HSN breakdown shows gross sales tax and refund tax separately
+        self.assertIn("90031900", report.hsn_totals)
+        hsn_stat = report.hsn_totals["90031900"]
+        self.assertEqual(hsn_stat.sales_taxable_paise, 847458)
+        self.assertEqual(hsn_stat.refund_taxable_paise, 847458)
+        self.assertEqual(hsn_stat.net_taxable_paise, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

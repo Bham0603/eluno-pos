@@ -98,6 +98,9 @@ class RefundService:
             self.repo.update_refund_status(refund_id, RefundStatus.FAILED, error_message=err_msg)
             raise ValidationError(message=err_msg)
 
+        # Durably store baseline refunded_paise before attempting terminal refund POST
+        self.repo.update_refund_baseline(refund_id, baseline_refunded_paise)
+
         # 3. Execute terminal refund with duplicate-prevention reconciliation
         terminal_refund_id = None
         try:
@@ -118,12 +121,11 @@ class RefundService:
                 # Conclusive! Terminal did process the refund
                 terminal_refund_id = f"trf_reconciled_{invoice.terminal_charge_id}"
                 self.repo.update_refund_terminal_captured(refund_id, terminal_refund_id, baseline_refunded_paise)
-            elif new_refunded_paise == baseline_refunded_paise:
-                # Conclusive: Not processed by terminal
-                self.repo.update_refund_status(refund_id, RefundStatus.FAILED, error_message=str(err))
-                raise
             else:
-                # Ambiguous
+                # Inconclusive / eventual consistency / read-after-write lag:
+                # Do NOT mark as FAILED! Merely observing unchanged refunded_paise on an immediate
+                # GET response cannot rule out that the gateway processed or is committing the refund.
+                # Keep the refund in PENDING_RECONCILIATION so operator or recovery job can safely inspect later.
                 self.repo.update_refund_status(refund_id, RefundStatus.PENDING_RECONCILIATION, error_message=str(err))
                 return RefundResult(
                     success=False,
@@ -132,7 +134,7 @@ class RefundService:
                     invoice_no=invoice.invoice_no,
                     status=RefundStatus.PENDING_RECONCILIATION,
                     amount_refunded_paise=0,
-                    error_message=f"Terminal refund outcome uncertain: {err}",
+                    error_message=f"Terminal refund outcome uncertain (read-after-write inconclusive): {err}",
                 )
         except Exception as err:
             self.repo.update_refund_status(refund_id, RefundStatus.FAILED, error_message=str(err))
@@ -352,7 +354,9 @@ class RefundService:
         # Phase A: If PENDING_RECONCILIATION, inspect terminal first
         if rec.status == RefundStatus.PENDING_RECONCILIATION and not rec.terminal_refund_id:
             charge = self.terminal_client.get_charge(rec.charge_id)
-            if charge.get("refunded_paise", 0) == rec.baseline_refunded_paise + rec.amount_paise:
+            current_refunded = charge.get("refunded_paise", 0)
+            expected_refunded = rec.baseline_refunded_paise + rec.amount_paise
+            if current_refunded == expected_refunded:
                 self.repo.update_refund_terminal_captured(
                     refund_id,
                     f"trf_reconciled_{rec.charge_id}",
@@ -360,7 +364,16 @@ class RefundService:
                 )
                 rec = self.repo.get_refund(refund_id)
             else:
-                return None
+                # Still inconclusive or not yet reflected: Keep pending, DO NOT initiate second POST
+                return RefundResult(
+                    success=False,
+                    refund_id=rec.refund_id,
+                    credit_note_no=rec.credit_note_no,
+                    invoice_no=rec.invoice_no,
+                    status=RefundStatus.PENDING_RECONCILIATION,
+                    amount_refunded_paise=0,
+                    error_message=f"Terminal refund still inconclusive (current: {current_refunded}, expected: {expected_refunded})",
+                )
 
         # Phase B: If TERMINAL_REFUNDED, allocate credit note if missing, then sync Shopify
         if rec.status in (RefundStatus.TERMINAL_REFUNDED, RefundStatus.PENDING_RECONCILIATION):
