@@ -844,12 +844,15 @@ class TestCli(unittest.TestCase):
             self.assertEqual(cur.fetchone()[0], 0)
 
     def test_refund_staff_authorization_rules(self) -> None:
-        """Requirement: Refund staff authorization rules:
-        A. Missing staff ID is rejected.
-        B. Unknown staff ID is rejected.
-        C. Staff from another store is rejected.
-        D. Valid store staff can authorize the refund.
-        E. Invalid staff causes zero terminal refund POST calls and zero refund intents.
+        """Requirement: Refund authorization and safety rules:
+        A. Missing invoice in --yes mode is rejected.
+        B. Missing staff ID in --yes mode is rejected.
+        C. Missing reason in --yes mode is rejected.
+        D. Unknown staff ID is rejected.
+        E. Staff from another store is rejected.
+        F. Explicitly inactive staff (is_active=False) is rejected before refund service invocation.
+        G. Zero terminal refund POST requests and zero refund intents for rejected cases.
+        H. Valid store staff can authorize the refund end-to-end.
         """
         # Create a posted invoice in store HSR
         inv = self.ctx.repo.allocate_invoice(
@@ -868,89 +871,146 @@ class TestCli(unittest.TestCase):
         self.ctx.repo.update_invoice_shopify_order(inv.invoice_no, 99000100, status=InvoiceStatus.POSTED)
 
         locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
-        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
+        staff_hsr = [
+            {"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "is_active": True},
+            {"staff_id": "S109", "name": "Dev", "role": "sales", "store_code": "HSR", "is_active": False},
+        ]
         all_staff = [
-            {"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"},
-            {"staff_id": "S101", "name": "Nikhil", "role": "sales", "store_code": "MM"},
+            {"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "is_active": True},
+            {"staff_id": "S109", "name": "Dev", "role": "sales", "store_code": "HSR", "is_active": False},
+            {"staff_id": "S101", "name": "Nikhil", "role": "sales", "store_code": "MM", "is_active": True},
         ]
 
-        # Case A: Missing staff ID is rejected under auto_confirm
-        captured_a = io.StringIO()
-        with patch("sys.stdout", captured_a), \
+        # Case A: Missing invoice in --yes mode is rejected
+        captured_a_inv = io.StringIO()
+        with patch("sys.stdout", captured_a_inv), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_a_inv:
+
+            ret_a_inv = run_refund(
+                ctx=self.ctx,
+                invoice_no=None,
+                staff_id="S108",
+                reason_code="CUSTOMER_RETURN",
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_a_inv, 1)
+            mock_term_a_inv.assert_not_called()
+        self.assertIn("Missing required argument '--invoice'", captured_a_inv.getvalue())
+
+        # Case B: Missing staff ID in --yes mode is rejected
+        captured_b_stf = io.StringIO()
+        with patch("sys.stdout", captured_b_stf), \
              patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
              patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
-             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_a:
+             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_b_stf:
 
-            ret_a = run_refund(
+            ret_b_stf = run_refund(
                 ctx=self.ctx,
                 invoice_no=inv.invoice_no,
                 staff_id=None,
                 reason_code="CUSTOMER_RETURN",
                 auto_confirm=True,
             )
-            self.assertEqual(ret_a, 1)
-            mock_term_a.assert_not_called()
-        self.assertIn("Missing required argument '--staff'", captured_a.getvalue())
+            self.assertEqual(ret_b_stf, 1)
+            mock_term_b_stf.assert_not_called()
+        self.assertIn("Missing required argument '--staff'", captured_b_stf.getvalue())
 
-        # Case B: Unknown staff ID is rejected
-        captured_b = io.StringIO()
-        with patch("sys.stdout", captured_b), \
+        # Case C: Missing reason in --yes mode is rejected
+        captured_c_rsn = io.StringIO()
+        with patch("sys.stdout", captured_c_rsn), \
              patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
              patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
-             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_b:
+             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_c_rsn:
 
-            ret_b = run_refund(
+            ret_c_rsn = run_refund(
+                ctx=self.ctx,
+                invoice_no=inv.invoice_no,
+                staff_id="S108",
+                reason_code=None,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_c_rsn, 1)
+            mock_term_c_rsn.assert_not_called()
+        self.assertIn("Missing required argument '--reason'", captured_c_rsn.getvalue())
+
+        # Case D: Unknown staff ID is rejected
+        captured_d_unk = io.StringIO()
+        with patch("sys.stdout", captured_d_unk), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
+             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_d_unk:
+
+            ret_d_unk = run_refund(
                 ctx=self.ctx,
                 invoice_no=inv.invoice_no,
                 staff_id="S999_UNKNOWN",
                 reason_code="CUSTOMER_RETURN",
                 auto_confirm=True,
             )
-            self.assertEqual(ret_b, 1)
-            mock_term_b.assert_not_called()
-        self.assertIn("not found in staff registry", captured_b.getvalue())
+            self.assertEqual(ret_d_unk, 1)
+            mock_term_d_unk.assert_not_called()
+        self.assertIn("not found in staff registry", captured_d_unk.getvalue())
 
-        # Case C: Staff from another store is rejected
-        captured_c = io.StringIO()
-        with patch("sys.stdout", captured_c), \
+        # Case E: Staff from another store is rejected
+        captured_e_other = io.StringIO()
+        with patch("sys.stdout", captured_e_other), \
              patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
              patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
-             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_c:
+             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_e_other:
 
-            ret_c = run_refund(
+            ret_e_other = run_refund(
                 ctx=self.ctx,
                 invoice_no=inv.invoice_no,
                 staff_id="S101",  # S101 is registered at MM, not HSR
                 reason_code="CUSTOMER_RETURN",
                 auto_confirm=True,
             )
-            self.assertEqual(ret_c, 1)
-            mock_term_c.assert_not_called()
-        self.assertIn("is registered at store 'MM', not invoice store 'HSR'", captured_c.getvalue())
+            self.assertEqual(ret_e_other, 1)
+            mock_term_e_other.assert_not_called()
+        self.assertIn("is registered at store 'MM', not invoice store 'HSR'", captured_e_other.getvalue())
 
-        # Case E check: Verify zero refund intents or credit notes exist in DB after failed attempts
+        # Case F: Explicitly inactive staff (is_active=False) is rejected before refund service invocation
+        captured_f_inact = io.StringIO()
+        with patch("sys.stdout", captured_f_inact), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
+             patch.object(self.ctx.terminal_client, "create_refund") as mock_term_f_inact:
+
+            ret_f_inact = run_refund(
+                ctx=self.ctx,
+                invoice_no=inv.invoice_no,
+                staff_id="S109",  # S109 has is_active=False
+                reason_code="CUSTOMER_RETURN",
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_f_inact, 1)
+            mock_term_f_inact.assert_not_called()
+        self.assertIn("is marked inactive", captured_f_inact.getvalue())
+
+        # Case G check: Verify zero refund intents or credit notes exist in DB after all failed attempts
         refunds_failed = self.ctx.repo.get_refunds_for_invoice(inv.invoice_no)
         self.assertEqual(len(refunds_failed), 0)
 
-        # Case D: Valid store staff can authorize the refund
-        captured_d = io.StringIO()
-        with patch("sys.stdout", captured_d), \
+        # Case H: Valid store staff can authorize the refund end-to-end
+        captured_h_valid = io.StringIO()
+        with patch("sys.stdout", captured_h_valid), \
              patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
              patch.object(self.ctx.smt_client, "get_staff", side_effect=lambda store_code=None: staff_hsr if store_code == "HSR" else all_staff), \
              patch.object(self.ctx.terminal_client, "get_charge", return_value={"status": "captured", "amount_paise": 100000, "refunded_paise": 0}), \
              patch.object(self.ctx.terminal_client, "create_refund", return_value={"status": "refunded", "refund_id": "trf_100"}), \
              patch.object(self.ctx.shopify_client, "create_refund", return_value={"id": 88000100}):
 
-            ret_d = run_refund(
+            ret_h_valid = run_refund(
                 ctx=self.ctx,
                 invoice_no=inv.invoice_no,
                 staff_id="S108",  # Valid HSR staff
                 reason_code="CUSTOMER_RETURN",
                 auto_confirm=True,
             )
-            self.assertEqual(ret_d, 0)
-        self.assertIn("FULL REFUND COMPLETED SUCCESSFULLY", captured_d.getvalue())
-        self.assertIn("trf_100", captured_d.getvalue())
+            self.assertEqual(ret_h_valid, 0)
+        self.assertIn("FULL REFUND COMPLETED SUCCESSFULLY", captured_h_valid.getvalue())
+        self.assertIn("trf_100", captured_h_valid.getvalue())
 
         # Verify completed refund in database
         refunds_ok = self.ctx.repo.get_refunds_for_invoice(inv.invoice_no)

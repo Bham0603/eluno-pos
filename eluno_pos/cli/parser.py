@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkout_p.add_argument("--override-reason", help="Mandatory audit reason code for manager discount.")
     checkout_p.add_argument("--override-manager-id", help="Staff ID of authorizing store manager.")
     checkout_p.add_argument("-m", "--method", default="upi", choices=["upi", "card", "cash"], help="Payment method (default: upi).")
-    checkout_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, auto-confirming all prompts with safe defaults.")
+    checkout_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively with explicit required arguments, bypassing interactive confirmation prompts.")
 
     # 4. REFUND: Full return & credit note issuance
     refund_p = subparsers.add_parser("refund", help="Process full return, terminal reversal, and credit note issuance.")
@@ -77,13 +77,13 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_p = subparsers.add_parser("reconcile", help="Inspect and recover in-flight, ambiguous, or pending operations.")
     reconcile_p.add_argument("-s", "--store", help="Filter pending transactions by store code.")
     reconcile_p.add_argument("-x", "--execute", action="store_true", help="Execute safe automated reconciliation routines.")
-    reconcile_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, auto-confirming all prompts with safe defaults.")
+    reconcile_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively, bypassing interactive confirmation prompts.")
 
     # 7. INVOICE: Document inspection
     invoice_p = subparsers.add_parser("invoice", help="Store tax invoice and audit inspection.")
     inv_sub = invoice_p.add_subparsers(dest="invoice_cmd", help="Invoice subcommands")
     inv_show_p = inv_sub.add_parser("show", help="Display full tax document, payment status, and itemized taxes.")
-    inv_show_p.add_argument("-i", "--invoice", dest="invoice_no", help="Invoice number to inspect (e.g. ELU/HSR/FY26/00001).")
+    inv_show_p.add_argument("-i", "--invoice", dest="invoice_no", help="Invoice number to inspect (e.g. ELU/HSR/FY27/00001).")
     inv_show_p.add_argument("pos_invoice_no", nargs="?", help="Positional invoice number.")
 
     return parser

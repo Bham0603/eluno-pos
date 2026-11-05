@@ -254,7 +254,7 @@ python -m eluno_pos reconcile --store HSR
 **Options:**
 - `--store`, `-s`: Filter by store code (optional).
 - `--execute`, `-x`: Execute safe automated reconciliation routines.
-- `--yes`, `-y`: Run non-interactively with safe defaults.
+- `--yes`, `-y`: Run non-interactively, bypassing confirmation prompts.
 
 **Recovery Mechanisms:**
 - **Terminal Payment Verification**: Queries payment terminal gateway by actual `charge_id` and checks status (never creates duplicate charges).
@@ -336,8 +336,3 @@ python -m eluno_pos reconcile --store HSR
 4. **Clinical Privacy Protection**: Optical parameters (SPH, CYL, AXIS, ADD, PD) are validated inside the POS engine and stored in clinic systems (SMT). Frontline CLI outputs and non-clinical systems (Shopify Admin API) receive only data-minimized references (`rx_id`), never full clinical eye measurements.
 5. **Strict Staff Store Association**: Staff authorization enforces that acting staff members are verified against the SMT registry for the active store. Unknown staff or staff from another store are rejected prior to any financial mutation.
 6. **Explicit Non-Interactive Authorization**: The `--yes` flag requires complete explicit transaction arguments and authorizes operations without interactive prompts. Missing parameters abort immediately without demo-data fallbacks.
-2. **Deterministic GST Allocation**:
-   - Frames: HSN `90031900` @ 18% ($9\%\text{ CGST} + 9\%\text{ SGST}$).
-   - Lenses: HSN `90015000` @ 5% ($2.5\%\text{ CGST} + 2.5\%\text{ SGST}$).
-   - $\text{Taxable} + \text{CGST} + \text{SGST} = \text{Net Line Amount}$ exactly to the paisa.
-3. **Clinical Privacy Protection**: Optical parameters (SPH, CYL, AXIS, ADD, PD) are validated inside the POS engine and stored in clinic systems (SMT). Frontline CLI outputs and non-clinical systems (Shopify Admin API) receive only data-minimized references (`rx_id`), never full clinical eye measurements.
