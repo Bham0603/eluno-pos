@@ -1629,14 +1629,14 @@ class TestDayEndReportService(unittest.TestCase):
 
     def test_tax_line_cgst_title_present_with_missing_or_invalid_price(self) -> None:
         """Requirement 3: Tax-line price validation.
-        CGST or SGST title present without a valid monetary price must be treated as incomplete tax metadata.
-        Do not invent a missing component or silently guess a split.
+        When CGST is missing/invalid and no order-level total_tax is available,
+        do NOT treat the partial SGST line as complete GST.
         """
         business_date = "2026-10-20"
         order_id = 95009003
         line_id = 96009003
 
-        # Tax line has CGST title but price is missing / empty; SGST has valid price
+        # Tax line has CGST title but price is missing / empty; SGST has valid price; NO order-level total_tax
         self.mock_shopify.get_orders.return_value = [
             {
                 "id": order_id,
@@ -1671,14 +1671,17 @@ class TestDayEndReportService(unittest.TestCase):
             reconcile_with_shopify=True,
         )
 
-        # 1. Known totals preserved
+        # 1. Do NOT treat partial tax line (381.36) as complete GST
         self.assertEqual(report.posted_sales_count, 1)
         self.assertEqual(report.gross_sales_paise, 500000)
-        self.assertEqual(report.sales_total_gst_paise, 38136)
+        self.assertEqual(report.sales_total_gst_paise, 0)
+        self.assertEqual(report.sales_taxable_value_paise, 500000)
 
         # 2. Do NOT invent missing CGST component or guess 50/50 split
         self.assertEqual(report.sales_cgst_paise, 0)
         self.assertEqual(report.sales_sgst_paise, 0)
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
 
         # 3. Discrepancy warning identifies order and line with missing/invalid tax line price
         self.assertFalse(report.is_reconciled)
@@ -1686,6 +1689,287 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertIn(str(order_id), discrepancy_text)
         self.assertIn(str(line_id), discrepancy_text)
         self.assertIn("missing or invalid CGST/SGST tax line price", discrepancy_text)
+
+    def test_cgst_price_missing_sgst_price_valid_and_order_total_tax_available(self) -> None:
+        """Requirement 1 & 2: CGST price missing, SGST price valid, and Shopify order-level total_tax available.
+        Preserve authoritative order-level total_tax in aggregate sales GST, calculate taxable value consistently,
+        do NOT guess CGST/SGST split, and attribute incomplete tax breakdown to UNKNOWN.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009010
+        line_id = 96009010
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "total_tax": "762.72",  # Authoritative order-level total_tax available!
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "FR-TEST-CGST-MISSING",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": ""},  # CGST price missing!
+                            {"title": "SGST", "price": "381.36"},  # SGST price valid!
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Authoritative order-level total_tax is preserved in aggregate sales GST
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.net_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 76272)
+
+        # 2. Aggregate taxable value is calculated consistently with GST-inclusive total
+        self.assertEqual(report.sales_taxable_value_paise, 423728)  # 500000 - 76272
+
+        # 3. CGST/SGST split is NOT guessed (remain 0)
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+
+        # 4. Uncertain tax is NOT allocated to 90031900; kept visible under UNKNOWN
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_total_gst_paise, 76272)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_taxable_paise, 423728)
+
+        # 5. Report marked unreconciled with specific discrepancy citing order and line
+        self.assertFalse(report.is_reconciled)
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn(str(line_id), discrepancy_text)
+        self.assertTrue(any("authoritative order-level total_tax" in d for d in report.discrepancies))
+
+    def test_sgst_price_missing_cgst_price_valid_and_order_total_tax_available(self) -> None:
+        """Requirement 1 & 2: SGST price missing, CGST price valid, and Shopify order-level total_tax available."""
+        business_date = "2026-10-20"
+        order_id = 95009020
+        line_id = 96009020
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "total_tax": "762.72",  # Authoritative order-level total_tax available!
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "FR-TEST-SGST-MISSING",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "381.36"},  # CGST price valid!
+                            {"title": "SGST", "price": ""},  # SGST price missing!
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Authoritative order-level total_tax is preserved in aggregate sales GST
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.net_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 76272)
+        self.assertEqual(report.sales_taxable_value_paise, 423728)
+
+        # 2. CGST/SGST split is NOT guessed
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+
+        # 3. Attribution kept visible under UNKNOWN
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_total_gst_paise, 76272)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_taxable_paise, 423728)
+        self.assertFalse(report.is_reconciled)
+
+    def test_one_invalid_tax_line_price_with_no_usable_order_level_total_tax(self) -> None:
+        """Requirement 3: One invalid tax-line price with no usable order-level total_tax.
+        Must not describe partial tax lines as complete GST.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009030
+        line_id = 96009030
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                # No usable order-level total_tax (explicitly None)
+                "total_tax": None,
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "FR-TEST-INVALID-TAX",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "corrupt_data"},  # Invalid price!
+                            {"title": "SGST", "price": "381.36"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Partial tax line is NOT treated as complete GST
+        self.assertEqual(report.sales_total_gst_paise, 0)
+        self.assertEqual(report.sales_taxable_value_paise, 500000)
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+
+        # 2. UNKNOWN HSN contains the unverified line
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_total_gst_paise, 0)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_taxable_paise, 500000)
+
+        # 3. Discrepancy flags that partial tax lines cannot be treated as complete GST
+        self.assertFalse(report.is_reconciled)
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn("Partial tax lines cannot be treated as complete GST", discrepancy_text)
+
+    def test_aggregate_gst_accurate_with_order_total_tax_while_breakdown_explicitly_incomplete(self) -> None:
+        """Requirement 4: Multi-line order where aggregate GST remains accurate via order-level total_tax,
+        while CGST/SGST and HSN breakdown remains explicitly incomplete for the defective line.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009040
+        valid_line_id = 96009041
+        defective_line_id = 96009042
+
+        # Line 1: Lens - valid CGST (23.79) and SGST (23.78) -> Total tax 47.57, price 999.00
+        # Line 2: Frame - incomplete CGST (empty), SGST (892.23) -> price 12998.00
+        # Order total tax: 1832.04 (47.57 + 1784.47)
+        # Order total price: 13997.00
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "13997.00",
+                "total_discounts": "0.00",
+                "total_price": "13997.00",
+                "total_tax": "1832.04",  # Order-level authoritative total_tax
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": valid_line_id,
+                        "sku": "LN-0001",
+                        "price": "999.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "23.79"},
+                            {"title": "SGST", "price": "23.78"},
+                        ],
+                    },
+                    {
+                        "id": defective_line_id,
+                        "sku": "FR-0001",
+                        "price": "12998.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": ""},  # Defective CGST!
+                            {"title": "SGST", "price": "892.23"},
+                        ],
+                    },
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Aggregate GST is accurate from authoritative order total_tax
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 1399700)
+        self.assertEqual(report.net_sales_paise, 1399700)
+        self.assertEqual(report.sales_total_gst_paise, 183204)  # 1832.04
+        self.assertEqual(report.sales_taxable_value_paise, 1399700 - 183204)  # 1216496
+
+        # 2. Only the complete lens line contributes to CGST/SGST totals (split NOT guessed for frame)
+        self.assertEqual(report.sales_cgst_paise, 2379)
+        self.assertEqual(report.sales_sgst_paise, 2378)
+
+        # 3. Verified lens line is in 90015000
+        self.assertIn("90015000", report.hsn_totals)
+        lens_hsn = report.hsn_totals["90015000"]
+        self.assertEqual(lens_hsn.sales_total_gst_paise, 4757)
+        self.assertEqual(lens_hsn.sales_cgst_paise, 2379)
+        self.assertEqual(lens_hsn.sales_sgst_paise, 2378)
+        self.assertEqual(lens_hsn.sales_taxable_paise, 99900 - 4757)
+
+        # 4. Defective frame line is NOT allocated to 90031900; kept visible under UNKNOWN
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        unknown_hsn = report.hsn_totals["UNKNOWN"]
+        self.assertEqual(unknown_hsn.sales_total_gst_paise, 183204 - 4757)  # 178447
+        self.assertEqual(unknown_hsn.sales_taxable_paise, 1299800 - 178447)  # 1121353
+        self.assertEqual(unknown_hsn.sales_cgst_paise, 0)
+        self.assertEqual(unknown_hsn.sales_sgst_paise, 0)
+
+        # 5. Report marked unreconciled
+        self.assertFalse(report.is_reconciled)
 
 
 if __name__ == "__main__":
