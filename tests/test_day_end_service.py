@@ -2224,5 +2224,93 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertIn("HSN tax breakdown does not reconcile with Shopify order total", discrepancy_text)
 
 
+    def test_verified_line_taxable_exceeding_shopify_order_taxable_discrepancy(self) -> None:
+        """Requirement: Verified line-level taxable value exceeds Shopify order taxable amount.
+        When verified line GST (762.72) is lower than order-level total_tax (1500.00), verified line
+        taxable (9237.28) exceeds order taxable amount (8500.00).
+        Verify:
+        1. Shopify's order-level GST remains the aggregate sales_total_gst_paise.
+        2. Shopify's order-level taxable amount remains the aggregate sales_taxable_value_paise.
+        3. No negative GST or artificial HSN allocation is created.
+        4. The report is marked is_reconciled=False.
+        5. The discrepancy identifies the order and states that verified line-level taxable value
+           exceeds Shopify's order taxable amount.
+        6. The HSN breakdown does not silently appear reconciled with the aggregate report.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009060
+        line_id = 96009060
+
+        # Order total: 10,000.00, order total_tax: 1,500.00 -> order taxable: 8,500.00 (850000 paise)
+        # Line: price 10,000.00, CGST 381.36, SGST 381.36 -> verified line GST: 762.72 (76272 paise)
+        # Line taxable: 10,000.00 - 762.72 = 9,237.28 (923728 paise)
+        # Verified line taxable (923728) > order taxable (850000)!
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "0.00",
+                "total_price": "10000.00",
+                "total_tax": "1500.00",  # Higher order-level total_tax
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "FR-TAXABLE-CONFLICT",
+                        "price": "10000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "381.36"},
+                            {"title": "SGST", "price": "381.36"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Shopify's order-level GST remains the aggregate sales_total_gst_paise
+        self.assertEqual(report.sales_total_gst_paise, 150000)
+
+        # 2. Shopify's order-level taxable amount remains aggregate sales_taxable_value_paise
+        self.assertEqual(report.sales_taxable_value_paise, 850000)
+
+        # 3. No negative GST or artificial HSN allocation is created
+        self.assertIn("90031900", report.hsn_totals)
+        frame_hsn = report.hsn_totals["90031900"]
+        self.assertEqual(frame_hsn.sales_total_gst_paise, 76272)
+        self.assertEqual(frame_hsn.sales_taxable_paise, 923728)
+        self.assertNotIn("UNKNOWN", report.hsn_totals)
+        self.assertTrue(all(h.sales_total_gst_paise >= 0 and h.sales_taxable_paise >= 0 for h in report.hsn_totals.values()))
+
+        # 4. Report is marked is_reconciled=False
+        self.assertFalse(report.is_reconciled)
+
+        # 5. Discrepancy identifies order and states verified taxable exceeds order taxable
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn("Verified line-level taxable value", discrepancy_text)
+        self.assertIn("exceeds Shopify order taxable amount", discrepancy_text)
+        self.assertIn("9237.28", discrepancy_text.replace(",", ""))
+        self.assertIn("8500.00", discrepancy_text.replace(",", ""))
+
+        # 6. HSN breakdown does not silently appear reconciled with aggregate report
+        sum_hsn_tax = sum(h.sales_total_gst_paise for h in report.hsn_totals.values())
+        self.assertNotEqual(sum_hsn_tax, report.sales_total_gst_paise)
+        sum_hsn_taxable = sum(h.sales_taxable_paise for h in report.hsn_totals.values())
+        self.assertNotEqual(sum_hsn_taxable, report.sales_taxable_value_paise)
+
+
 if __name__ == "__main__":
     unittest.main()
