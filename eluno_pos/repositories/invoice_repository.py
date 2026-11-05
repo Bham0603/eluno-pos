@@ -1070,3 +1070,53 @@ class InvoiceRepository:
             )
             return [self._build_refund_from_row(r) for r in cur.fetchall()]
 
+
+
+    def get_pending_invoices(self, store_code: Optional[str] = None) -> List[Invoice]:
+        """Retrieve invoices currently awaiting reconciliation."""
+        with self._get_connection() as conn:
+            if store_code:
+                cur = conn.execute(
+                    "SELECT * FROM invoices WHERE status = ? AND store_code = ? ORDER BY seq ASC;",
+                    (InvoiceStatus.PENDING_RECONCILIATION.value, store_code),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM invoices WHERE status = ? ORDER BY created_at ASC;",
+                    (InvoiceStatus.PENDING_RECONCILIATION.value,),
+                )
+            return [self._build_invoice_from_row(conn, row) for row in cur.fetchall()]
+
+    def get_pending_refunds(self, store_code: Optional[str] = None) -> List[RefundRecord]:
+        """Retrieve refunds that are incomplete or awaiting reconciliation."""
+        pending_statuses = (
+            RefundStatus.INITIATED.value,
+            RefundStatus.TERMINAL_REFUNDED.value,
+            RefundStatus.PENDING_RECONCILIATION.value,
+        )
+        placeholders = ",".join("?" for _ in pending_statuses)
+        with self._get_connection() as conn:
+            if store_code:
+                cur = conn.execute(
+                    f"""
+                    SELECT r.* FROM refunds r
+                    JOIN invoices i ON r.invoice_no = i.invoice_no
+                    WHERE i.store_code = ? AND r.status IN ({placeholders})
+                    ORDER BY r.created_at ASC;
+                    """,
+                    (store_code, *pending_statuses),
+                )
+            else:
+                cur = conn.execute(
+                    f"SELECT * FROM refunds WHERE status IN ({placeholders}) ORDER BY created_at ASC;",
+                    pending_statuses,
+                )
+            return [self._build_refund_from_row(r) for r in cur.fetchall()]
+
+    def get_pending_shopify_intents(self) -> List[Dict[str, Any]]:
+        """Retrieve Shopify order creation intents that are unresolved or ambiguous."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM shopify_order_intents WHERE status IN ('PENDING', 'AMBIGUOUS') ORDER BY created_at ASC;"
+            )
+            return [dict(r) for r in cur.fetchall()]
