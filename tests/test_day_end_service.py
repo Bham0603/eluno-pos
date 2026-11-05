@@ -1498,6 +1498,195 @@ class TestDayEndReportService(unittest.TestCase):
             ["Shopify reconciliation skipped; figures are based on the local SQLite ledger."]
         )
 
+    def test_unsupported_non_empty_hsn_recorded_under_unknown_with_warning(self) -> None:
+        """Requirement 1: Validate line-item HSN against starter-kit/data/tax_rates.json.
+        Unsupported HSN values (e.g. 'ABC123') must be recorded under UNKNOWN with explicit discrepancy.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009001
+        line_id = 96009001
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "SKU-CUSTOM",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "ABC123"}],  # Unsupported non-empty HSN!
+                        "tax_lines": [
+                            {"title": "CGST", "price": "228.81"},
+                            {"title": "SGST", "price": "228.81"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Available financial totals are preserved
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.net_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 45762)
+
+        # 2. Unsupported HSN is NOT accepted; recorded under UNKNOWN
+        self.assertNotIn("ABC123", report.hsn_totals)
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_total_gst_paise, 45762)
+
+        # 3. Explicit data-quality discrepancy citing order and line ID
+        self.assertFalse(report.is_reconciled)
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn(str(line_id), discrepancy_text)
+        self.assertIn("Unsupported HSN 'ABC123'", discrepancy_text)
+
+    def test_missing_shopify_line_items_does_not_silently_enrich_from_sqlite(self) -> None:
+        """Requirement 2: Shopify remains the primary financial source.
+        Do NOT silently reconstruct missing Shopify line_items from SQLite invoice lines.
+        Preserve order-level totals, mark itemized tax/HSN breakdown as incomplete, and add explicit warning.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009002
+
+        # 1. Create a matching invoice in SQLite with rich line items
+        inv = self.repo.allocate_invoice(
+            store_code="HSR",
+            financial_year="FY26",
+            checkout_ref="chk_no_silent_enrich",
+            customer_id=80001001,
+            gross_paise=1000000,
+            discount_paise=0,
+            net_paise=1000000,
+            taxable_paise=847458,
+            tax_paise=152542,
+            lines=[
+                self._create_line("L_FR", "frame", 800000, "90031900", 677966, 61017, 61017, 122034),
+                self._create_line("L_LN", "lens", 200000, "90015000", 190476, 4762, 4762, 9524),
+            ],
+        )
+        self.repo.update_invoice_payment(inv.invoice_no, "chg_no_silent")
+        self.repo.update_invoice_shopify_order(inv.invoice_no, order_id, InvoiceStatus.POSTED)
+
+        with self.repo._get_connection() as conn:
+            conn.execute("UPDATE invoices SET created_at = '2026-10-20T10:00:00+05:30';")
+
+        # 2. Mock Shopify: Returns order with empty line_items
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "0.00",
+                "total_price": "10000.00",
+                "total_tax": "1525.42",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [],  # Missing line items from Shopify!
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 3. Order-level financial totals are preserved from Shopify payload
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 1000000)
+        self.assertEqual(report.net_sales_paise, 1000000)
+        self.assertEqual(report.sales_total_gst_paise, 152542)
+
+        # 4. Must NOT silently enrich from SQLite: 90031900 and 90015000 should NOT be populated
+        self.assertNotIn("90031900", report.hsn_totals)
+        self.assertNotIn("90015000", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+
+        # 5. Explicit warning added explaining missing line_items
+        self.assertFalse(report.is_reconciled)
+        self.assertTrue(any(f"Order {order_id}: Missing line_items" in d for d in report.discrepancies))
+
+    def test_tax_line_cgst_title_present_with_missing_or_invalid_price(self) -> None:
+        """Requirement 3: Tax-line price validation.
+        CGST or SGST title present without a valid monetary price must be treated as incomplete tax metadata.
+        Do not invent a missing component or silently guess a split.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009003
+        line_id = 96009003
+
+        # Tax line has CGST title but price is missing / empty; SGST has valid price
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "FR-TEST-TAX",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": ""},  # Empty / missing price!
+                            {"title": "SGST", "price": "381.36"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Known totals preserved
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 38136)
+
+        # 2. Do NOT invent missing CGST component or guess 50/50 split
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+
+        # 3. Discrepancy warning identifies order and line with missing/invalid tax line price
+        self.assertFalse(report.is_reconciled)
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn(str(line_id), discrepancy_text)
+        self.assertIn("missing or invalid CGST/SGST tax line price", discrepancy_text)
+
 
 if __name__ == "__main__":
     unittest.main()

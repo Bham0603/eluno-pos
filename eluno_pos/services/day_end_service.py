@@ -51,6 +51,31 @@ class DayEndReportService:
         s = str(val).strip()
         return int((Decimal(s) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
+    def _is_valid_hsn(self, hsn: Optional[str]) -> bool:
+        """Validate line-item HSN against the configured HSN master from tax_rates.json."""
+        if not hsn:
+            return False
+        clean = str(hsn).strip()
+        if not clean:
+            return False
+        valid_hsns = {e.hsn for e in self.gst_service.entries}
+        return clean in valid_hsns
+
+    def _parse_tax_line_price(self, tl: Any) -> Optional[int]:
+        """Validate and parse a tax line monetary price into paise. Returns None if missing or invalid."""
+        if not isinstance(tl, dict):
+            return None
+        price_val = tl.get("price")
+        if price_val is None:
+            return None
+        price_str = str(price_val).strip()
+        if not price_str:
+            return None
+        try:
+            return self._parse_money(price_str)
+        except Exception:
+            return None
+
     def _get_line_tax_breakdown(self, line: InvoiceLine, inv_date_str: str):
         """Extract line tax breakdown from persisted values or calculate using original invoice date."""
         if line.taxable_paise > 0 or line.tax_paise > 0:
@@ -184,31 +209,6 @@ class DayEndReportService:
 
             line_items = o.get("line_items", [])
 
-            # Enrich line items from local SQLite invoice if line_items is empty in mock stub
-            if not line_items and "id" in o:
-                try:
-                    with self.repo._get_connection() as conn:
-                        cur = conn.execute("SELECT * FROM invoices WHERE shopify_order_id = ?;", (o["id"],))
-                        row = cur.fetchone()
-                        if row:
-                            local_inv = self.repo._build_invoice_from_row(conn, row)
-                            line_items = [
-                                {
-                                    "id": l.variant_id,
-                                    "price": format_paise_to_rupees(l.unit_price_paise),
-                                    "quantity": l.quantity,
-                                    "total_discount": format_paise_to_rupees(l.discount_paise),
-                                    "properties": [{"name": "hsn", "value": l.hsn}],
-                                    "tax_lines": [
-                                        {"title": "CGST", "price": format_paise_to_rupees(l.cgst_paise)},
-                                        {"title": "SGST", "price": format_paise_to_rupees(l.sgst_paise)},
-                                    ],
-                                }
-                                for l in local_inv.lines
-                            ]
-                except Exception:
-                    pass
-
             order_line_gross_sum = 0
             order_line_taxable_sum = 0
             order_line_cgst_sum = 0
@@ -225,37 +225,57 @@ class DayEndReportService:
                     li_net = li_gross - li_discount
                     order_line_gross_sum += li_gross
 
-                    # Extract HSN from properties - never silently assume an unknown line is a frame
-                    hsn = None
+                    # Extract HSN from properties - validate against tax_rates.json master
+                    raw_hsn = None
                     for prop in li.get("properties", []):
-                        if prop.get("name") == "hsn" and prop.get("value"):
+                        if isinstance(prop, dict) and prop.get("name") == "hsn" and prop.get("value") is not None:
                             val = str(prop["value"]).strip()
                             if val:
-                                hsn = val
+                                raw_hsn = val
                             break
 
-                    if not hsn:
+                    if raw_hsn and self._is_valid_hsn(raw_hsn):
+                        hsn = raw_hsn
+                    else:
                         hsn = "UNKNOWN"
-                        quality_discrepancies.append(
-                            f"Order {order_id_str} line {line_id_str}: Missing or invalid HSN metadata; recorded under 'UNKNOWN'."
-                        )
+                        if raw_hsn:
+                            quality_discrepancies.append(
+                                f"Order {order_id_str} line {line_id_str}: Unsupported HSN '{raw_hsn}'; recorded under 'UNKNOWN'."
+                            )
+                        else:
+                            quality_discrepancies.append(
+                                f"Order {order_id_str} line {line_id_str}: Missing or invalid HSN metadata; recorded under 'UNKNOWN'."
+                            )
                     _ensure_hsn(hsn)
 
-                    # Extract CGST and SGST from tax_lines
+                    # Extract and validate CGST and SGST from tax_lines
                     tax_lines = li.get("tax_lines", [])
-                    has_cgst = any(tl.get("title") == "CGST" for tl in tax_lines)
-                    has_sgst = any(tl.get("title") == "SGST" for tl in tax_lines)
-                    li_cgst = sum(self._parse_money(tl.get("price")) for tl in tax_lines if tl.get("title") == "CGST")
-                    li_sgst = sum(self._parse_money(tl.get("price")) for tl in tax_lines if tl.get("title") == "SGST")
-                    li_tot_tax = sum(self._parse_money(tl.get("price")) for tl in tax_lines)
+                    cgst_tls = [tl for tl in tax_lines if isinstance(tl, dict) and tl.get("title") == "CGST"]
+                    sgst_tls = [tl for tl in tax_lines if isinstance(tl, dict) and tl.get("title") == "SGST"]
 
-                    if not (has_cgst and has_sgst):
+                    cgst_prices = [self._parse_tax_line_price(tl) for tl in cgst_tls]
+                    sgst_prices = [self._parse_tax_line_price(tl) for tl in sgst_tls]
+
+                    has_valid_cgst = len(cgst_prices) > 0 and all(p is not None for p in cgst_prices)
+                    has_valid_sgst = len(sgst_prices) > 0 and all(p is not None for p in sgst_prices)
+
+                    parsed_tot_tax = 0
+                    for tl in tax_lines:
+                        p = self._parse_tax_line_price(tl)
+                        if p is not None:
+                            parsed_tot_tax += p
+
+                    if has_valid_cgst and has_valid_sgst:
+                        li_cgst = sum(p for p in cgst_prices if p is not None)
+                        li_sgst = sum(p for p in sgst_prices if p is not None)
+                        li_tot_tax = parsed_tot_tax
+                    else:
                         quality_discrepancies.append(
-                            f"Order {order_id_str} line {line_id_str}: Incomplete tax data; missing explicit CGST/SGST breakdown in tax_lines."
+                            f"Order {order_id_str} line {line_id_str}: Incomplete tax data; missing CGST/SGST breakdown (missing or invalid CGST/SGST tax line price)."
                         )
-                        # Do not guess CGST/SGST splits when missing; identify incomplete tax data explicitly
                         li_cgst = 0
                         li_sgst = 0
+                        li_tot_tax = parsed_tot_tax
 
                     li_taxable = li_net - li_tot_tax
                     order_line_taxable_sum += li_taxable
@@ -277,7 +297,7 @@ class DayEndReportService:
                 sales_total_gst_paise += order_line_tot_tax_sum
             else:
                 quality_discrepancies.append(
-                    f"Order {order_id_str}: Missing line_items; HSN and statutory tax breakdown could not be determined."
+                    f"Order {order_id_str}: Missing line_items; itemized HSN and tax breakdown is incomplete."
                 )
                 gross_sales_paise += order_subtotal if order_subtotal > 0 else order_net
                 total_discounts_paise += order_discounts
@@ -347,35 +367,48 @@ class DayEndReportService:
                         line_id_str = str(li_id or "UNKNOWN_LINE")
                         orig_li = order_lines_by_id.get(li_id)
 
-                        hsn = None
+                        raw_hsn = None
                         orig_tax_lines = []
                         orig_qty = 1
                         if orig_li:
                             orig_qty = int(orig_li.get("quantity", 1))
                             orig_tax_lines = orig_li.get("tax_lines", [])
                             for prop in orig_li.get("properties", []):
-                                if prop.get("name") == "hsn" and prop.get("value"):
+                                if isinstance(prop, dict) and prop.get("name") == "hsn" and prop.get("value") is not None:
                                     val = str(prop["value"]).strip()
                                     if val:
-                                        hsn = val
+                                        raw_hsn = val
                                     break
-                        if not hsn:
+                        if raw_hsn and self._is_valid_hsn(raw_hsn):
+                            hsn = raw_hsn
+                        else:
                             hsn = "UNKNOWN"
-                            quality_discrepancies.append(
-                                f"Order {order_id_str} refund line {line_id_str}: Missing or invalid HSN metadata; recorded under 'UNKNOWN'."
-                            )
+                            if raw_hsn:
+                                quality_discrepancies.append(
+                                    f"Order {order_id_str} refund line {line_id_str}: Unsupported HSN '{raw_hsn}'; recorded under 'UNKNOWN'."
+                                )
+                            else:
+                                quality_discrepancies.append(
+                                    f"Order {order_id_str} refund line {line_id_str}: Missing or invalid HSN metadata; recorded under 'UNKNOWN'."
+                                )
                         _ensure_hsn(hsn)
 
                         rl_taxable = self._parse_money(rl.get("subtotal"))
                         rl_tot_tax = self._parse_money(rl.get("total_tax"))
                         ref_qty = int(rl.get("quantity", 1))
 
-                        has_orig_cgst = any(tl.get("title") == "CGST" for tl in orig_tax_lines)
-                        has_orig_sgst = any(tl.get("title") == "SGST" for tl in orig_tax_lines)
-                        orig_cgst = sum(self._parse_money(tl.get("price")) for tl in orig_tax_lines if tl.get("title") == "CGST")
-                        orig_sgst = sum(self._parse_money(tl.get("price")) for tl in orig_tax_lines if tl.get("title") == "SGST")
+                        orig_cgst_tls = [tl for tl in orig_tax_lines if isinstance(tl, dict) and tl.get("title") == "CGST"]
+                        orig_sgst_tls = [tl for tl in orig_tax_lines if isinstance(tl, dict) and tl.get("title") == "SGST"]
 
-                        if has_orig_cgst and has_orig_sgst and (orig_cgst > 0 or orig_sgst > 0):
+                        orig_cgst_prices = [self._parse_tax_line_price(tl) for tl in orig_cgst_tls]
+                        orig_sgst_prices = [self._parse_tax_line_price(tl) for tl in orig_sgst_tls]
+
+                        has_valid_orig_cgst = len(orig_cgst_prices) > 0 and all(p is not None for p in orig_cgst_prices)
+                        has_valid_orig_sgst = len(orig_sgst_prices) > 0 and all(p is not None for p in orig_sgst_prices)
+
+                        if has_valid_orig_cgst and has_valid_orig_sgst:
+                            orig_cgst = sum(p for p in orig_cgst_prices if p is not None)
+                            orig_sgst = sum(p for p in orig_sgst_prices if p is not None)
                             if ref_qty == orig_qty:
                                 rl_cgst = orig_cgst
                                 rl_sgst = orig_sgst
@@ -386,7 +419,7 @@ class DayEndReportService:
                             # Do not guess CGST/SGST splits when missing; identify incomplete tax data explicitly
                             if rl_tot_tax > 0:
                                 quality_discrepancies.append(
-                                    f"Order {order_id_str} refund line {line_id_str}: Incomplete tax data; missing original CGST/SGST breakdown."
+                                    f"Order {order_id_str} refund line {line_id_str}: Incomplete tax data; missing or invalid original CGST/SGST breakdown and tax line price."
                                 )
                             rl_cgst = 0
                             rl_sgst = 0
@@ -401,27 +434,9 @@ class DayEndReportService:
                         hsn_data[hsn]["refund_sgst_paise"] += rl_sgst
                         hsn_data[hsn]["refund_total_gst_paise"] += rl_tot_tax
                 else:
-                    # If refund_line_items is empty in mock stub, attempt enrichment from local SQLite
-                    try:
-                        with self.repo._get_connection() as conn:
-                            cur = conn.execute("SELECT * FROM refunds WHERE shopify_refund_id = ?;", (ref_id,))
-                            ref_row = cur.fetchone()
-                            if ref_row:
-                                orig_inv = self.repo.get_invoice(ref_row["invoice_no"])
-                                if orig_inv:
-                                    for line in orig_inv.lines:
-                                        _ensure_hsn(line.hsn)
-                                        t_taxable, t_cgst, t_sgst, t_tot = self._get_line_tax_breakdown(line, orig_inv.created_at)
-                                        refund_taxable_value_paise += t_taxable
-                                        refund_cgst_paise += t_cgst
-                                        refund_sgst_paise += t_sgst
-                                        refund_total_gst_paise += t_tot
-                                        hsn_data[line.hsn]["refund_taxable_paise"] += t_taxable
-                                        hsn_data[line.hsn]["refund_cgst_paise"] += t_cgst
-                                        hsn_data[line.hsn]["refund_sgst_paise"] += t_sgst
-                                        hsn_data[line.hsn]["refund_total_gst_paise"] += t_tot
-                    except Exception:
-                        pass
+                    quality_discrepancies.append(
+                        f"Order {order_id_str} refund {ref_id}: Missing refund_line_items; itemized HSN and tax reversal breakdown is incomplete."
+                    )
 
         # 3. Compute Net Figures (Sales less Refunds)
         net_sales_after_refunds_paise = net_sales_paise - refunds_amount_paise
