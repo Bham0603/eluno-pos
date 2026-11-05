@@ -290,16 +290,16 @@ class DayEndReportService:
                 order_line_gross_sum = sum(l["li_gross"] for l in parsed_lines)
                 effective_order_net = (order_line_gross_sum - order_discounts) if order_net == 0 else order_net
 
-                any_incomplete_tax = any(not l["is_tax_complete"] for l in parsed_lines)
+                # Separate verified complete lines from incomplete lines
+                complete_lines = []
+                incomplete_lines = []
+                complete_lines_taxable = 0
+                complete_lines_cgst = 0
+                complete_lines_sgst = 0
+                complete_lines_tax = 0
 
-                if not any_incomplete_tax:
-                    # All lines have complete, valid CGST and SGST breakdowns
-                    order_line_taxable_sum = 0
-                    order_line_cgst_sum = 0
-                    order_line_sgst_sum = 0
-                    order_line_tot_tax_sum = 0
-
-                    for l in parsed_lines:
+                for l in parsed_lines:
+                    if l["is_tax_complete"]:
                         li_cgst = sum(p for p in l["cgst_prices"] if p is not None)
                         li_sgst = sum(p for p in l["sgst_prices"] if p is not None)
                         li_tot_tax = li_cgst + li_sgst
@@ -311,66 +311,52 @@ class DayEndReportService:
                         hsn_data[hsn]["sales_sgst_paise"] += li_sgst
                         hsn_data[hsn]["sales_total_gst_paise"] += li_tot_tax
 
-                        order_line_taxable_sum += li_taxable
-                        order_line_cgst_sum += li_cgst
-                        order_line_sgst_sum += li_sgst
-                        order_line_tot_tax_sum += li_tot_tax
+                        complete_lines.append(l)
+                        complete_lines_taxable += li_taxable
+                        complete_lines_cgst += li_cgst
+                        complete_lines_sgst += li_sgst
+                        complete_lines_tax += li_tot_tax
+                    else:
+                        incomplete_lines.append(l)
 
-                    gross_sales_paise += order_line_gross_sum
-                    total_discounts_paise += order_discounts
-                    net_sales_paise += effective_order_net
-                    sales_taxable_value_paise += order_line_taxable_sum
-                    sales_cgst_paise += order_line_cgst_sum
-                    sales_sgst_paise += order_line_sgst_sum
-                    sales_total_gst_paise += order_line_tot_tax_sum
-                else:
-                    # One or more lines have incomplete CGST/SGST metadata
-                    complete_lines_taxable = 0
-                    complete_lines_cgst = 0
-                    complete_lines_sgst = 0
-                    complete_lines_tax = 0
+                incomplete_lines_net = sum(l["li_net"] for l in incomplete_lines)
 
-                    for l in parsed_lines:
-                        if l["is_tax_complete"]:
-                            li_cgst = sum(p for p in l["cgst_prices"] if p is not None)
-                            li_sgst = sum(p for p in l["sgst_prices"] if p is not None)
-                            li_tot_tax = li_cgst + li_sgst
-                            li_taxable = l["li_net"] - li_tot_tax
-                            hsn = l["valid_hsn"] or "UNKNOWN"
-                            _ensure_hsn(hsn)
-                            hsn_data[hsn]["sales_taxable_paise"] += li_taxable
-                            hsn_data[hsn]["sales_cgst_paise"] += li_cgst
-                            hsn_data[hsn]["sales_sgst_paise"] += li_sgst
-                            hsn_data[hsn]["sales_total_gst_paise"] += li_tot_tax
+                gross_sales_paise += order_line_gross_sum
+                total_discounts_paise += order_discounts
+                net_sales_paise += effective_order_net
 
-                            complete_lines_taxable += li_taxable
-                            complete_lines_cgst += li_cgst
-                            complete_lines_sgst += li_sgst
-                            complete_lines_tax += li_tot_tax
+                # CGST and SGST splits are NOT guessed when metadata is incomplete
+                sales_cgst_paise += complete_lines_cgst
+                sales_sgst_paise += complete_lines_sgst
 
-                    incomplete_lines = [l for l in parsed_lines if not l["is_tax_complete"]]
-                    incomplete_lines_net = sum(l["li_net"] for l in incomplete_lines)
+                if order_total_tax_paise is not None:
+                    # Authoritative Shopify order-level total_tax is provided
+                    ord_tax = order_total_tax_paise
+                    ord_taxable = effective_order_net - ord_tax
 
-                    gross_sales_paise += order_line_gross_sum
-                    total_discounts_paise += order_discounts
-                    net_sales_paise += effective_order_net
-
-                    # CGST and SGST splits are NOT guessed when metadata is incomplete
-                    sales_cgst_paise += complete_lines_cgst
-                    sales_sgst_paise += complete_lines_sgst
-
-                    if order_total_tax_paise is not None:
-                        # Authoritative Shopify order-level total_tax is preserved
-                        ord_tax = order_total_tax_paise
-                        ord_taxable = effective_order_net - ord_tax
-
-                        incomplete_tax = max(0, ord_tax - complete_lines_tax)
-                        incomplete_taxable = max(0, ord_taxable - complete_lines_taxable)
-
+                    # Consistency check: detect when verified line GST exceeds order total_tax
+                    if complete_lines_tax > ord_tax:
+                        incomplete_tax = 0
+                        quality_discrepancies.append(
+                            f"Order {order_id_str}: Verified line-level GST (₹{format_paise_to_rupees(complete_lines_tax)}) exceeds Shopify authoritative order total_tax (₹{format_paise_to_rupees(ord_tax)}). HSN tax breakdown does not reconcile with Shopify order total."
+                        )
                         sales_total_gst_paise += ord_tax
+                    else:
+                        incomplete_tax = ord_tax - complete_lines_tax
+                        sales_total_gst_paise += ord_tax
+
+                    # Consistency check: detect when verified line taxable exceeds order taxable
+                    if complete_lines_taxable > ord_taxable:
+                        incomplete_taxable = 0
+                        quality_discrepancies.append(
+                            f"Order {order_id_str}: Verified line-level taxable value (₹{format_paise_to_rupees(complete_lines_taxable)}) exceeds Shopify order taxable amount (₹{format_paise_to_rupees(ord_taxable)}). HSN taxable breakdown does not reconcile with Shopify order total."
+                        )
+                        sales_taxable_value_paise += ord_taxable
+                    else:
+                        incomplete_taxable = ord_taxable - complete_lines_taxable
                         sales_taxable_value_paise += ord_taxable
 
-                        # Incomplete line attribution kept visible under UNKNOWN
+                    if incomplete_lines:
                         _ensure_hsn("UNKNOWN")
                         hsn_data["UNKNOWN"]["sales_taxable_paise"] += incomplete_taxable
                         hsn_data["UNKNOWN"]["sales_total_gst_paise"] += incomplete_tax
@@ -379,35 +365,25 @@ class DayEndReportService:
                             quality_discrepancies.append(
                                 f"Order {order_id_str} line {l['line_id_str']}: Incomplete tax data; missing CGST/SGST breakdown (missing or invalid CGST/SGST tax line price). Preserving authoritative order-level total_tax (₹{format_paise_to_rupees(order_total_tax_paise)}); line tax allocated to 'UNKNOWN'."
                             )
-                    else:
-                        # No authoritative order-level total_tax available
-                        # Do not treat partial tax lines as complete GST
-                        incomplete_tax = 0
-                        incomplete_taxable = incomplete_lines_net
+                else:
+                    # No authoritative order-level total_tax exists
+                    # Only lines with valid CGST AND valid SGST prices contribute verified line-level GST
+                    # Every incomplete line contributes zero unverified GST
+                    incomplete_tax = 0
+                    incomplete_taxable = incomplete_lines_net
 
-                        for l in incomplete_lines:
-                            if not l["has_partial_tax_lines"]:
-                                tot_p = sum(self._parse_tax_line_price(tl) or 0 for tl in l["tax_lines"])
-                                if tot_p > 0:
-                                    incomplete_tax += tot_p
-                                    incomplete_taxable -= tot_p
+                    sales_total_gst_paise += complete_lines_tax
+                    sales_taxable_value_paise += (complete_lines_taxable + incomplete_taxable)
 
-                        sales_total_gst_paise += (complete_lines_tax + incomplete_tax)
-                        sales_taxable_value_paise += (complete_lines_taxable + incomplete_taxable)
-
+                    if incomplete_lines:
                         _ensure_hsn("UNKNOWN")
                         hsn_data["UNKNOWN"]["sales_taxable_paise"] += incomplete_taxable
-                        hsn_data["UNKNOWN"]["sales_total_gst_paise"] += incomplete_tax
+                        hsn_data["UNKNOWN"]["sales_total_gst_paise"] += 0
 
                         for l in incomplete_lines:
-                            if l["has_partial_tax_lines"]:
-                                quality_discrepancies.append(
-                                    f"Order {order_id_str} line {l['line_id_str']}: Incomplete tax data; missing CGST/SGST breakdown (missing or invalid CGST/SGST tax line price) with no authoritative order-level total_tax. Partial tax lines cannot be treated as complete GST."
-                                )
-                            else:
-                                quality_discrepancies.append(
-                                    f"Order {order_id_str} line {l['line_id_str']}: Incomplete tax data; missing CGST/SGST breakdown (missing or invalid CGST/SGST tax line price)."
-                                )
+                            quality_discrepancies.append(
+                                f"Order {order_id_str} line {l['line_id_str']}: Incomplete tax data; missing or invalid CGST/SGST breakdown (missing or invalid CGST/SGST tax line price) with no authoritative order-level total_tax. Partial tax lines cannot be treated as complete GST; Unverified line contributes zero GST."
+                            )
 
             # Payment method and channel from note_attributes or transactions
             attrs = {a.get("name"): a.get("value") for a in o.get("note_attributes", []) if isinstance(a, dict)}

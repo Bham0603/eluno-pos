@@ -1270,6 +1270,7 @@ class TestDayEndReportService(unittest.TestCase):
                 "subtotal_price": "5000.00",
                 "total_discounts": "0.00",
                 "total_price": "5000.00",
+                "total_tax": "238.10",
                 "created_at": f"{business_date}T10:00:00+05:30",
                 "line_items": [
                     {
@@ -1970,6 +1971,257 @@ class TestDayEndReportService(unittest.TestCase):
 
         # 5. Report marked unreconciled
         self.assertFalse(report.is_reconciled)
+
+
+
+    def test_totaltax_only_line_with_no_order_level_total_tax_contributes_zero_gst(self) -> None:
+        """Requirement 1: TotalTax-only line with no order-level total_tax.
+        Must NOT be counted as verified GST (contributes zero GST).
+        """
+        business_date = "2026-10-20"
+        order_id = 95009051
+        line_id = 96009051
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "total_tax": None,  # No order-level total_tax!
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "LN-TOTALTAX-ONLY",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}],
+                        "tax_lines": [{"title": "TotalTax", "price": "381.36"}],  # Generic TotalTax line!
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Incomplete line contributes ZERO verified GST
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.net_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 0)
+        self.assertEqual(report.sales_taxable_value_paise, 500000)
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+
+        # 2. Taxable amount held under UNKNOWN; 90015000 has zero allocated
+        self.assertNotIn("90015000", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_total_gst_paise, 0)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_taxable_paise, 500000)
+
+        # 3. Report marked unreconciled with specific discrepancy
+        self.assertFalse(report.is_reconciled)
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn(str(line_id), discrepancy_text)
+        self.assertIn("Unverified line contributes zero GST", discrepancy_text)
+
+    def test_empty_tax_lines_with_no_order_level_total_tax_contributes_zero_gst(self) -> None:
+        """Requirement 1: Empty tax_lines with no order-level total_tax.
+        Incomplete line must contribute zero GST.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009052
+        line_id = 96009052
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "total_tax": None,
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "LN-EMPTY-TAX",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}],
+                        "tax_lines": [],  # Empty tax lines!
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        self.assertEqual(report.sales_total_gst_paise, 0)
+        self.assertEqual(report.sales_taxable_value_paise, 500000)
+        self.assertEqual(report.sales_cgst_paise, 0)
+        self.assertEqual(report.sales_sgst_paise, 0)
+        self.assertNotIn("90015000", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_total_gst_paise, 0)
+        self.assertEqual(report.hsn_totals["UNKNOWN"].sales_taxable_paise, 500000)
+        self.assertFalse(report.is_reconciled)
+
+    def test_complete_line_plus_incomplete_totaltax_only_line_no_order_total_tax(self) -> None:
+        """Requirement 1: Complete line plus incomplete TotalTax-only line without order total_tax.
+        ONLY the complete line contributes verified GST; incomplete line contributes zero GST.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009053
+        complete_line_id = 96009053
+        incomplete_line_id = 96009054
+
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "0.00",
+                "total_price": "10000.00",
+                "total_tax": None,  # No order-level total_tax!
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": complete_line_id,
+                        "sku": "FR-0001",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "381.36"},
+                            {"title": "SGST", "price": "381.36"},
+                        ],
+                    },
+                    {
+                        "id": incomplete_line_id,
+                        "sku": "LN-0001",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90015000"}],
+                        "tax_lines": [{"title": "TotalTax", "price": "238.10"}],
+                    },
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. ONLY complete frame line contributes verified GST (381.36 + 381.36 = 762.72)
+        self.assertEqual(report.sales_total_gst_paise, 76272)
+        self.assertEqual(report.sales_cgst_paise, 38136)
+        self.assertEqual(report.sales_sgst_paise, 38136)
+
+        # 2. Complete frame line verified under 90031900
+        self.assertIn("90031900", report.hsn_totals)
+        frame_hsn = report.hsn_totals["90031900"]
+        self.assertEqual(frame_hsn.sales_total_gst_paise, 76272)
+        self.assertEqual(frame_hsn.sales_taxable_paise, 500000 - 76272)
+
+        # 3. Incomplete lens line contributes zero GST and is held under UNKNOWN
+        self.assertNotIn("90015000", report.hsn_totals)
+        self.assertIn("UNKNOWN", report.hsn_totals)
+        unknown_hsn = report.hsn_totals["UNKNOWN"]
+        self.assertEqual(unknown_hsn.sales_total_gst_paise, 0)
+        self.assertEqual(unknown_hsn.sales_taxable_paise, 500000)
+
+        # 4. Total taxable combines complete taxable + incomplete net
+        self.assertEqual(report.sales_taxable_value_paise, (500000 - 76272) + 500000)
+        self.assertFalse(report.is_reconciled)
+
+    def test_verified_line_gst_exceeding_shopify_order_level_total_tax_discrepancy(self) -> None:
+        """Requirement 2: Verified line-level GST exceeds Shopify authoritative order total_tax.
+        Must preserve Shopify order total_tax as aggregate GST, not silently clamp,
+        add a clear order-level discrepancy, and keep report marked unreconciled.
+        """
+        business_date = "2026-10-20"
+        order_id = 95009055
+        line_id = 96009055
+
+        # Verified line tax = 381.36 + 381.36 = 762.72 (76272 paise)
+        # Shopify order-level total_tax = 500.00 (50000 paise)
+        # Verified line GST exceeds order total_tax!
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": order_id,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "10000.00",
+                "total_discounts": "0.00",
+                "total_price": "10000.00",
+                "total_tax": "500.00",  # Conflicting smaller order total_tax!
+                "created_at": f"{business_date}T10:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": line_id,
+                        "sku": "FR-CONFLICT",
+                        "price": "10000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "381.36"},
+                            {"title": "SGST", "price": "381.36"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # 1. Preserve Shopify's order-level total as the aggregate GST figure
+        self.assertEqual(report.sales_total_gst_paise, 50000)
+        self.assertEqual(report.sales_taxable_value_paise, 1000000 - 50000)
+
+        # 2. Report marked unreconciled
+        self.assertFalse(report.is_reconciled)
+
+        # 3. Explicit discrepancy showing both amounts and explaining conflict
+        discrepancy_text = " ".join(report.discrepancies)
+        self.assertIn(str(order_id), discrepancy_text)
+        self.assertIn("Verified line-level GST", discrepancy_text)
+        self.assertIn("762.72", discrepancy_text)
+        self.assertIn("500.00", discrepancy_text)
+        self.assertIn("HSN tax breakdown does not reconcile with Shopify order total", discrepancy_text)
 
 
 if __name__ == "__main__":
