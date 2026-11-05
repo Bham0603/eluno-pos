@@ -32,6 +32,7 @@ class CartLine:
     coating: Optional[str] = None  # 'standard', 'anti_reflective', 'blue_cut', 'photochromic'
     rx_id: Optional[str] = None
     for_customer_id: Optional[int] = None
+    wearer_name: Optional[str] = None
     discount_allocations: List[DiscountAllocation] = field(default_factory=list)
 
     @property

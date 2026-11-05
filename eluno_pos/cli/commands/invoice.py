@@ -51,8 +51,15 @@ def run_invoice_show(ctx: AppContext, invoice_no: Optional[str] = None) -> int:
         pair_rx = f"Pair: {line.pair_ref or '-'}"
         if line.rx_id:
             pair_rx += f" (Rx: {line.rx_id})"
-        if getattr(line, "for_customer_id", None):
-            pair_rx += f" [Wearer #{line.for_customer_id}]"
+        wearer_tag = ""
+        if getattr(line, "wearer_name", None) and getattr(line, "for_customer_id", None):
+            wearer_tag = f" [Wearer: {line.wearer_name} (#{line.for_customer_id})]"
+        elif getattr(line, "for_customer_id", None):
+            wearer_tag = f" [Wearer #{line.for_customer_id}]"
+        elif getattr(line, "wearer_name", None):
+            wearer_tag = f" [Wearer: {line.wearer_name}]"
+        if wearer_tag:
+            pair_rx += wearer_tag
 
         rows.append([
             f"{line.sku}\n{line.title}",

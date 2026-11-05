@@ -61,6 +61,7 @@ class InvoiceLine:
     lens_config: Optional[str] = None
     properties: List[Dict[str, str]] = field(default_factory=list)
     for_customer_id: Optional[int] = None
+    wearer_name: Optional[str] = None
 
 
 @dataclass

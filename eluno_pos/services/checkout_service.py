@@ -133,6 +133,8 @@ class CheckoutService:
                 line_props.append({"name": "rx_id", "value": str(line.rx_id)})
             if line.for_customer_id is not None:
                 line_props.append({"name": "for_customer_id", "value": str(line.for_customer_id)})
+            if getattr(line, "wearer_name", None):
+                line_props.append({"name": "wearer_name", "value": str(line.wearer_name)})
 
             inv_lines.append(
                 InvoiceLine(
@@ -156,6 +158,7 @@ class CheckoutService:
                     lens_config=lens_cfg,
                     properties=line_props,
                     for_customer_id=line.for_customer_id,
+                    wearer_name=getattr(line, "wearer_name", None),
                 )
             )
 

@@ -183,8 +183,8 @@ class TestCli(unittest.TestCase):
     def test_strict_store_validation_rejects_invalid_store(self) -> None:
         """Requirement: Invalid store code must reject checkout and not allocate an invoice."""
         locations = [
-            {"id": 70000001, "name": "Eluno Mantri Mall", "eluno": {"store_code": "MM"}},
-            {"id": 70000002, "name": "Eluno HSR Layout", "eluno": {"store_code": "HSR"}},
+            {"id": 70000001, "name": "Eluno Mantri Mall", "active": True, "eluno": {"store_code": "MM", "kind": "store"}},
+            {"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}},
         ]
         captured = io.StringIO()
         with patch("sys.stdout", captured), \
@@ -209,7 +209,7 @@ class TestCli(unittest.TestCase):
 
     def test_strict_staff_validation_rejects_unverified_staff(self) -> None:
         """Requirement: Staff member must match store records; invalid staff terminates checkout."""
-        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "eluno": {"store_code": "HSR"}}]
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
         staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "can_override_discount": True}]
 
         captured = io.StringIO()
@@ -237,7 +237,7 @@ class TestCli(unittest.TestCase):
     def test_strict_hsn_metadata_missing_rejects_products(self) -> None:
         """Requirement: Missing HSN metadata in catalogue rejects frame or lens immediately."""
         fake_cust = _make_customer()
-        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "eluno": {"store_code": "HSR"}}]
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
         staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "can_override_discount": True}]
 
         # Frame without HSN
@@ -263,7 +263,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(ret, 1)
 
         output = captured.getvalue()
-        self.assertIn("missing mandatory HSN metadata", output)
+        self.assertIn("missing mandatory HSN", output)
 
         # Lens without HSN
         frame_ok = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
@@ -288,12 +288,12 @@ class TestCli(unittest.TestCase):
             self.assertEqual(ret, 1)
 
         output = captured.getvalue()
-        self.assertIn("missing mandatory HSN metadata", output)
+        self.assertIn("missing mandatory HSN", output)
 
     def test_prescription_id_validation_rejects_missing_or_expired(self) -> None:
         """Requirement: If --rx specifies an ID not belonging to customer or expired, reject."""
         fake_cust = _make_customer()
-        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "eluno": {"store_code": "HSR"}}]
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
         staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
 
         # 1. Non-existent prescription
@@ -355,7 +355,7 @@ class TestCli(unittest.TestCase):
     def test_family_billing_association_persisted(self) -> None:
         """Requirement: Selected wearer/recipient is persisted as for_customer_id in SQLite."""
         fake_cust = _make_customer()
-        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "eluno": {"store_code": "HSR"}}]
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
         staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "can_override_discount": True}]
         frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
         lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
@@ -432,6 +432,416 @@ class TestCli(unittest.TestCase):
         output = captured.getvalue()
         self.assertIn("Persisted Shopify location ID missing", output)
         self.assertIn("kept PENDING for supervisor / manual resolution", output)
+
+    def test_blank_confirmation_does_not_initiate_payment(self) -> None:
+        """Requirement 1: Blank confirmation (pressing Enter with default=False) does not initiate payment."""
+        fake_cust = _make_customer()
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "can_override_discount": True}]
+        frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
+        lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), \
+             patch("eluno_pos.cli.commands.checkout.prompt_confirm", return_value=False) as mock_confirm, \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge") as mock_charge, \
+             patch.object(self.ctx.shopify_client, "create_order") as mock_order:
+
+            ret = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=False,
+            )
+            self.assertEqual(ret, 0)
+            mock_confirm.assert_called_once()
+            # Verify zero payment charges or shopify orders initiated
+            mock_charge.assert_not_called()
+            mock_order.assert_not_called()
+
+        output = captured.getvalue()
+        self.assertIn("Payment cancelled by staff", output)
+        self.assertIn("marked CANCELLED without initiating terminal charges", output)
+
+        # In database, status must be CANCELLED
+        inv = self.ctx.repo.get_invoice("ELU/HSR/FY27/00001" if date.today().month >= 4 else "ELU/HSR/FY26/00001")
+        self.assertIsNotNone(inv)
+        self.assertEqual(inv.status, InvoiceStatus.CANCELLED)
+
+    def test_missing_required_arguments_with_yes_do_not_initiate_payment(self) -> None:
+        """Requirement 1: Missing required arguments with --yes must not default silently and must not allocate invoice or pay."""
+        fake_cust = _make_customer()
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
+        frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
+        lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+
+        cases = [
+            # Missing store
+            {"store_code": None, "staff_id": "S108", "customer_phone": "+919000000001", "frame_variant_id": 91000001, "lens_variant_id": 91000041, "err": "--store"},
+            # Missing staff
+            {"store_code": "HSR", "staff_id": None, "customer_phone": "+919000000001", "frame_variant_id": 91000001, "lens_variant_id": 91000041, "err": "--staff"},
+            # Missing customer
+            {"store_code": "HSR", "staff_id": "S108", "customer_phone": None, "frame_variant_id": 91000001, "lens_variant_id": 91000041, "err": "--customer"},
+            # Missing frame
+            {"store_code": "HSR", "staff_id": "S108", "customer_phone": "+919000000001", "frame_variant_id": None, "lens_variant_id": 91000041, "err": "--frame"},
+            # Missing lens
+            {"store_code": "HSR", "staff_id": "S108", "customer_phone": "+919000000001", "frame_variant_id": 91000001, "lens_variant_id": None, "err": "--lens"},
+        ]
+
+        for case in cases:
+            captured = io.StringIO()
+            with patch("sys.stdout", captured), \
+                 patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+                 patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+                 patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+                 patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+                 patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+                 patch.object(self.ctx.terminal_client, "create_charge") as mock_charge:
+
+                ret = run_checkout(
+                    ctx=self.ctx,
+                    store_code=case["store_code"],
+                    staff_id=case["staff_id"],
+                    customer_phone=case["customer_phone"],
+                    frame_variant_id=case["frame_variant_id"],
+                    lens_variant_id=case["lens_variant_id"],
+                    auto_confirm=True,
+                )
+                self.assertEqual(ret, 1)
+                self.assertIn(f"Missing required argument '{case['err']}'", captured.getvalue())
+                mock_charge.assert_not_called()
+
+        # Zero invoices in database across all failed attempts
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_explicit_complete_checkout_with_yes_works(self) -> None:
+        """Requirement 1: Explicit complete checkout with --yes succeeds end-to-end."""
+        fake_cust = _make_customer()
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
+        frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
+        lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge", return_value={"status": "captured", "charge_id": "ch_mock_999"}), \
+             patch.object(self.ctx.shopify_client, "create_order", return_value={"id": 77000099, "order_number": 1099, "financial_status": "paid"}):
+
+            ret = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret, 0)
+
+        output = captured.getvalue()
+        self.assertIn("TRANSACTION COMPLETED SUCCESSFULLY", output)
+        self.assertIn("ch_mock_999", output)
+
+    def test_family_wearer_identity_four_scenarios(self) -> None:
+        """Requirement 2: Test 4 scenarios for family wearer identity:
+        A. Purchaser wearing product.
+        B. Enrolled family member with customer ID.
+        C. Unenrolled family member identified by name (for_customer_id is NULL).
+        D. Correct persistence after application restart, and display in invoice show.
+        """
+        fake_cust = _make_customer(cid=80001001)
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
+        frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
+        lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+
+        fy = get_financial_year()
+
+        # --- Scenario A: Purchaser wearing product ---
+        with patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge", return_value={"status": "captured", "charge_id": "ch_a"}), \
+             patch.object(self.ctx.shopify_client, "create_order", return_value={"id": 77000001, "order_number": 1001}):
+
+            ret_a = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                for_member="Self",
+                for_customer_id=80001001,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_a, 0)
+
+        inv_a = self.ctx.repo.get_invoice(f"ELU/HSR/{fy}/00001")
+        self.assertIsNotNone(inv_a)
+        self.assertEqual(inv_a.lines[0].for_customer_id, 80001001)
+        self.assertEqual(inv_a.lines[0].wearer_name, "Self")
+
+        # --- Scenario B: Enrolled family member with a customer ID ---
+        with patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge", return_value={"status": "captured", "charge_id": "ch_b"}), \
+             patch.object(self.ctx.shopify_client, "create_order", return_value={"id": 77000002, "order_number": 1002}):
+
+            ret_b = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                for_member="Priya",
+                for_customer_id=80001005,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_b, 0)
+
+        inv_b = self.ctx.repo.get_invoice(f"ELU/HSR/{fy}/00002")
+        self.assertIsNotNone(inv_b)
+        self.assertEqual(inv_b.lines[0].for_customer_id, 80001005)
+        self.assertEqual(inv_b.lines[0].wearer_name, "Priya")
+
+        # --- Scenario C: Unenrolled family member identified by name ---
+        with patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge", return_value={"status": "captured", "charge_id": "ch_c"}), \
+             patch.object(self.ctx.shopify_client, "create_order", return_value={"id": 77000003, "order_number": 1003}):
+
+            ret_c = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                for_member="Rohan",
+                for_customer_id=None,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_c, 0)
+
+        inv_c = self.ctx.repo.get_invoice(f"ELU/HSR/{fy}/00003")
+        self.assertIsNotNone(inv_c)
+        # CRUCIAL: for_customer_id must be None (NULL), NOT mapped to purchaser (80001001)
+        self.assertIsNone(inv_c.lines[0].for_customer_id)
+        self.assertEqual(inv_c.lines[0].wearer_name, "Rohan")
+
+        # --- Scenario D: Application restart persistence and invoice show ---
+        fresh_repo = InvoiceRepository(self.db_path)
+        reloaded_inv = fresh_repo.get_invoice(inv_c.invoice_no)
+        self.assertIsNotNone(reloaded_inv)
+        self.assertIsNone(reloaded_inv.lines[0].for_customer_id)
+        self.assertEqual(reloaded_inv.lines[0].wearer_name, "Rohan")
+
+        # Verify invoice show displays wearer name
+        captured_show = io.StringIO()
+        with patch("sys.stdout", captured_show):
+            ret_show = run_invoice_show(self.ctx, invoice_no=inv_c.invoice_no)
+            self.assertEqual(ret_show, 0)
+        show_output = captured_show.getvalue()
+        self.assertIn("[Wearer: Rohan]", show_output)
+
+    def test_expired_prescription_safety_interactive_and_non_interactive(self) -> None:
+        """Requirement 3: When all prescriptions on file are expired:
+        - Non-interactive without --rx plano rejects.
+        - Non-interactive with --rx plano succeeds in plano mode.
+        - Interactive prompt rejected cancels checkout.
+        - Interactive prompt accepted proceeds in plano mode.
+        """
+        fake_cust = _make_customer()
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
+        frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
+        lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+        expired_rx = Prescription(
+            rx_id="RX_OLD",
+            customer_id=80001001,
+            phone="+919000000001",
+            date="2024-01-01",
+            source="in_store",
+            od=EyePrescription(sph=1.0),
+            os=EyePrescription(sph=1.0),
+            pd=PupillaryDistance(binocular=60),
+            valid_until="2025-01-01",
+        )
+
+        # 1. Non-interactive without --rx plano: must reject
+        captured1 = io.StringIO()
+        with patch("sys.stdout", captured1), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[expired_rx]):
+
+            ret1 = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret1, 1)
+        self.assertIn("All prescriptions on file are expired", captured1.getvalue())
+        self.assertIn("provide '--rx plano'", captured1.getvalue())
+
+        # 2. Non-interactive with --rx plano: succeeds
+        captured2 = io.StringIO()
+        with patch("sys.stdout", captured2), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[expired_rx]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge", return_value={"status": "captured", "charge_id": "ch_p"}), \
+             patch.object(self.ctx.shopify_client, "create_order", return_value={"id": 77000010, "order_number": 1010}):
+
+            ret2 = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                rx_id="plano",
+                auto_confirm=True,
+            )
+            self.assertEqual(ret2, 0)
+        self.assertIn("Explicit plano / non-corrective mode requested", captured2.getvalue())
+
+        # 3. Interactive with staff declining plano: rejects
+        captured3 = io.StringIO()
+        with patch("sys.stdout", captured3), \
+             patch("eluno_pos.cli.commands.checkout.prompt_confirm", side_effect=[False]), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[expired_rx]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict):
+
+            ret3 = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=False,
+            )
+            self.assertEqual(ret3, 1)
+        self.assertIn("Cannot proceed with expired prescription", captured3.getvalue())
+
+    def test_retail_location_filtering_rejects_hq_and_inactive(self) -> None:
+        """Requirement 4: Only active retail stores allowed; HQ and inactive locations must be rejected."""
+        locations = [
+            {"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}},
+            {"id": 70000008, "name": "Eluno HQ & Lab", "active": True, "eluno": {"store_code": "HQ", "kind": "warehouse"}},
+            {"id": 70000009, "name": "Eluno Old Store", "active": False, "eluno": {"store_code": "OLD", "kind": "store"}},
+        ]
+
+        # 1. Reject HQ
+        captured_hq = io.StringIO()
+        with patch("sys.stdout", captured_hq), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations):
+            ret_hq = run_checkout(
+                ctx=self.ctx,
+                store_code="HQ",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_hq, 1)
+        self.assertIn("Location 'HQ' is a warehouse, not an active retail store", captured_hq.getvalue())
+
+        # 2. Reject inactive location
+        captured_inact = io.StringIO()
+        with patch("sys.stdout", captured_inact), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations):
+            ret_inact = run_checkout(
+                ctx=self.ctx,
+                store_code="OLD",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret_inact, 1)
+        self.assertIn("Location 'OLD' is inactive and cannot be selected for checkout", captured_inact.getvalue())
+
+        # Verify zero invoices allocated
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_hsn_source_strictness_only_eluno_hsn(self) -> None:
+        """Requirement 5: HSN must be under variant.eluno.hsn; undocumented top-level fallback rejected."""
+        fake_cust = _make_customer()
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR"}]
+
+        # Frame has top-level hsn but empty eluno metadata
+        frame_with_top_level_only = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "hsn": "90031900", "eluno": {}}
+        lens_ok = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_with_top_level_only if vid == 91000001 else lens_ok):
+
+            ret = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                auto_confirm=True,
+            )
+            self.assertEqual(ret, 1)
+
+        output = captured.getvalue()
+        self.assertIn("missing mandatory HSN code in 'variant.eluno.hsn'", output)
+
+        # Zero invoices in database
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            self.assertEqual(cur.fetchone()[0], 0)
 
 
 if __name__ == "__main__":

@@ -110,6 +110,8 @@ class ShopifyOrderService:
 
             if line.for_customer_id:
                 props.append({"name": "for_customer_id", "value": str(line.for_customer_id)})
+            if getattr(line, "wearer_name", None):
+                props.append({"name": "wearer_name", "value": str(line.wearer_name)})
 
             # Build discount allocations
             discount_allocations = []

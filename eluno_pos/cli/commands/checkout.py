@@ -42,7 +42,7 @@ def run_checkout(
     print_header("Eluno POS — Retail Optical Checkout", "Guided 15-Step Prescription & Pairing Flow")
 
     # =========================================================================
-    # Step 1: Select Store / Location (Strict Validation)
+    # Step 1: Select Store / Location (Retail Location Filtering)
     # =========================================================================
     print("\n--- Step 1: Store & Location Selection ---")
     locations = ctx.shopify_client.get_locations()
@@ -53,25 +53,42 @@ def run_checkout(
     def _extract_store_code(loc_dict: Dict[str, Any]) -> Optional[str]:
         return loc_dict.get("eluno", {}).get("store_code") or loc_dict.get("store_code")
 
-    valid_store_codes = [_extract_store_code(l) for l in locations if _extract_store_code(l)]
+    # In accordance with assignment schema, only locations with active=true and eluno.kind="store"
+    # may be selected for retail sales checkout. HQ (kind="warehouse") and inactive stores are strictly excluded.
+    retail_locations = [
+        loc for loc in locations
+        if loc.get("active") is True and loc.get("eluno", {}).get("kind") == "store"
+    ]
+    valid_store_codes = [_extract_store_code(l) for l in retail_locations if _extract_store_code(l)]
 
     selected_store = store_code
     if not selected_store:
         if auto_confirm:
-            selected_store = "HSR" if "HSR" in valid_store_codes else (valid_store_codes[0] if valid_store_codes else None)
+            print("✖ Error: Missing required argument '--store' for non-interactive checkout.")
+            return 1
         else:
-            loc_options = [f"{loc['name']} ({_extract_store_code(loc) or loc['name']})" for loc in locations]
-            print(f"Available stores: {', '.join(loc_options)}")
+            loc_options = [f"{loc['name']} ({_extract_store_code(loc) or loc['name']})" for loc in retail_locations]
+            print(f"Available retail stores: {', '.join(loc_options)}")
             selected_store = prompt_input("Select Store Code", default=valid_store_codes[0] if valid_store_codes else "HSR").upper()
 
     if not selected_store:
         print("✖ Error: Store selection is required.")
         return 1
 
-    loc = next((l for l in locations if _extract_store_code(l) == selected_store or l.get("name", "").upper() == selected_store.upper() or str(l.get("id")) == str(selected_store)), None)
+    loc = next((l for l in retail_locations if _extract_store_code(l) == selected_store or l.get("name", "").upper() == selected_store.upper() or str(l.get("id")) == str(selected_store)), None)
     if not loc:
-        print(f"✖ Error: Invalid store code '{selected_store}'. Valid store codes: {', '.join(valid_store_codes)}")
-        return 1
+        # Check if location exists in general catalogue but is non-retail or inactive
+        any_loc = next((l for l in locations if _extract_store_code(l) == selected_store or l.get("name", "").upper() == selected_store.upper() or str(l.get("id")) == str(selected_store)), None)
+        if any_loc:
+            if not any_loc.get("active"):
+                print(f"✖ Error: Location '{selected_store}' is inactive and cannot be selected for checkout.")
+                return 1
+            kind = any_loc.get("eluno", {}).get("kind", "non-store")
+            print(f"✖ Error: Location '{selected_store}' is a {kind}, not an active retail store. Valid retail stores: {', '.join(valid_store_codes)}")
+            return 1
+        else:
+            print(f"✖ Error: Invalid store code '{selected_store}'. Valid store codes: {', '.join(valid_store_codes)}")
+            return 1
 
     location_id = int(loc["id"])
     store_code_val = _extract_store_code(loc) or loc.get("store_code") or str(loc["id"])
@@ -86,13 +103,14 @@ def run_checkout(
     selected_staff_id = staff_id
     if not selected_staff_id:
         if auto_confirm:
-            selected_staff_id = staff_list[0]["staff_id"] if staff_list else None
+            print("✖ Error: Missing required argument '--staff' for non-interactive checkout.")
+            return 1
         else:
             if staff_list:
                 print("Staff on duty:")
                 for s in staff_list[:5]:
                     print(f"  • {s['staff_id']} — {s['name']} ({s['role']})")
-                selected_staff_id = prompt_input("Enter Operating Staff ID", default=staff_list[0]["staff_id"])
+                selected_staff_id = prompt_input("Enter Operating Staff ID")
             else:
                 selected_staff_id = prompt_input("Enter Operating Staff ID")
 
@@ -111,6 +129,10 @@ def run_checkout(
             print(f"✖ Error: Staff member '{selected_staff_id}' not found in staff registry.")
         return 1
 
+    if staff_member.get("is_active") is False:
+        print(f"✖ Error: Staff member '{selected_staff_id}' is marked inactive.")
+        return 1
+
     print(f"✔ Logged-in Staff: {staff_member['name']} ({staff_member['role']}) [ID: {staff_member['staff_id']}]")
 
     # =========================================================================
@@ -120,9 +142,14 @@ def run_checkout(
     c_phone = customer_phone
     if not c_phone:
         if auto_confirm:
-            c_phone = "+919000000001"
+            print("✖ Error: Missing required argument '--customer' for non-interactive checkout.")
+            return 1
         else:
-            c_phone = prompt_input("Enter Customer Phone", default="+919000000001")
+            c_phone = prompt_input("Enter Customer Phone")
+
+    if not c_phone:
+        print("✖ Error: Customer phone number is required.")
+        return 1
 
     customer = ctx.customer_service.find_by_phone(c_phone)
     if not customer:
@@ -139,7 +166,12 @@ def run_checkout(
     selected_rx = None
     tx_date = transaction_date or date.today()
 
-    if rx_id:
+    is_explicit_plano = bool(rx_id and rx_id.strip().lower() in ("plano", "none", "0"))
+
+    if is_explicit_plano:
+        selected_rx = None
+        print("✔ Explicit plano / non-corrective mode requested.")
+    elif rx_id:
         # Explicit prescription requested: MUST exist for this customer
         selected_rx = next((rx for rx in prescriptions if rx.rx_id == rx_id), None)
         if not selected_rx:
@@ -151,36 +183,46 @@ def run_checkout(
         add_present = "Yes" if (selected_rx.od.add or selected_rx.os.add) else "No"
         print(f"✔ Selected Prescription: {selected_rx.rx_id} dated {selected_rx.date} (Source: {selected_rx.optometrist_id or 'SMT'}, Status: Valid, ADD: {add_present})")
     elif prescriptions:
+        valid_rxs = [rx for rx in prescriptions if rx.is_valid_on(tx_date)]
         print(f"Found {len(prescriptions)} prescription(s) on record:")
         for i, rx in enumerate(prescriptions):
             add_present = "Yes" if (rx.od.add or rx.os.add) else "No"
             valid_str = "Valid" if rx.is_valid_on(tx_date) else f"Expired ({rx.valid_until})"
             print(f"  [{i + 1}] {rx.rx_id} (Date: {rx.date}, Source: {rx.optometrist_id or 'SMT'}, Status: {valid_str}, ADD: {add_present})")
 
-        if auto_confirm:
-            valid_rxs = [rx for rx in prescriptions if rx.is_valid_on(tx_date)]
-            selected_rx = valid_rxs[0] if valid_rxs else None
-            if not selected_rx:
-                print("  • Notice: All prescriptions on file are expired. Proceeding in plano/non-corrective mode.")
-        else:
-            rx_choice = prompt_input("Select Prescription [number or ID, or 'plano']", default="1")
-            if rx_choice.lower() in ("plano", "none", "0"):
-                selected_rx = None
-            elif rx_choice.isdigit() and 1 <= int(rx_choice) <= len(prescriptions):
-                candidate_rx = prescriptions[int(rx_choice) - 1]
-                if not candidate_rx.is_valid_on(tx_date):
-                    print(f"✖ Error: Selected prescription {candidate_rx.rx_id} is expired (valid until {candidate_rx.valid_until}).")
-                    return 1
-                selected_rx = candidate_rx
+        if not valid_rxs:
+            # All prescriptions on file are expired
+            if auto_confirm:
+                print("✖ Error: All prescriptions on file are expired. In non-interactive mode, plano mode cannot be assumed silently; provide '--rx plano' to explicitly authorize plano.")
+                return 1
             else:
-                candidate_rx = next((rx for rx in prescriptions if rx.rx_id == rx_choice), None)
-                if not candidate_rx:
-                    print(f"✖ Error: Prescription '{rx_choice}' not found for customer.")
+                allow_plano = prompt_confirm("All prescriptions on file are expired. Do you want to proceed in plano / non-corrective mode?", default=False)
+                if not allow_plano:
+                    print("✖ Error: Cannot proceed with expired prescription. Optical consultation required.")
                     return 1
-                if not candidate_rx.is_valid_on(tx_date):
-                    print(f"✖ Error: Selected prescription {candidate_rx.rx_id} is expired (valid until {candidate_rx.valid_until}).")
-                    return 1
-                selected_rx = candidate_rx
+                selected_rx = None
+        else:
+            if auto_confirm:
+                selected_rx = valid_rxs[0]
+            else:
+                rx_choice = prompt_input("Select Prescription [number or ID, or 'plano']", default="1")
+                if rx_choice.lower() in ("plano", "none", "0"):
+                    selected_rx = None
+                elif rx_choice.isdigit() and 1 <= int(rx_choice) <= len(prescriptions):
+                    candidate_rx = prescriptions[int(rx_choice) - 1]
+                    if not candidate_rx.is_valid_on(tx_date):
+                        print(f"✖ Error: Selected prescription {candidate_rx.rx_id} is expired (valid until {candidate_rx.valid_until}).")
+                        return 1
+                    selected_rx = candidate_rx
+                else:
+                    candidate_rx = next((rx for rx in prescriptions if rx.rx_id == rx_choice), None)
+                    if not candidate_rx:
+                        print(f"✖ Error: Prescription '{rx_choice}' not found for customer.")
+                        return 1
+                    if not candidate_rx.is_valid_on(tx_date):
+                        print(f"✖ Error: Selected prescription {candidate_rx.rx_id} is expired (valid until {candidate_rx.valid_until}).")
+                        return 1
+                    selected_rx = candidate_rx
 
         if selected_rx:
             add_present = "Yes" if (selected_rx.od.add or selected_rx.os.add) else "No"
@@ -198,25 +240,38 @@ def run_checkout(
     wearer_cust_id: Optional[int] = for_customer_id
 
     if not member_name and wearer_cust_id is None:
-        is_family = "family" in (customer.tags or "").lower()
-        default_member = "Self" if not is_family else "Self"
         if auto_confirm:
-            member_name = default_member
-            wearer_cust_id = customer.id
-        else:
-            member_name = prompt_input("Individual recipient name or Customer ID for this pair", default=default_member)
-
-    if wearer_cust_id is None:
-        if member_name and member_name.isdigit():
-            wearer_cust_id = int(member_name)
-        elif not member_name or member_name.lower() in ("self", "primary", customer.first_name.lower()):
-            wearer_cust_id = customer.id
             member_name = "Self"
-        else:
-            # Documented data model limitation:
-            # The Shopify line-item properties and pair domain models persist individual family members as an integer `for_customer_id`.
-            # If the user enters a non-numeric text name, we associate it with the purchasing customer's ID while preserving the label for receipts.
             wearer_cust_id = customer.id
+        else:
+            member_input = prompt_input("Individual recipient name or Customer ID for this pair", default="Self")
+            if member_input.isdigit():
+                wearer_cust_id = int(member_input)
+                member_name = f"Customer #{wearer_cust_id}"
+            elif member_input.lower() in ("self", "primary", customer.first_name.lower()):
+                member_name = "Self"
+                wearer_cust_id = customer.id
+            else:
+                member_name = member_input
+                wearer_cust_id = None
+    else:
+        if wearer_cust_id is not None:
+            if not member_name:
+                if wearer_cust_id == customer.id:
+                    member_name = "Self"
+                else:
+                    member_name = f"Customer #{wearer_cust_id}"
+        elif member_name:
+            if member_name.isdigit():
+                wearer_cust_id = int(member_name)
+                member_name = f"Customer #{wearer_cust_id}"
+            elif member_name.lower() in ("self", "primary", customer.first_name.lower()):
+                wearer_cust_id = customer.id
+                member_name = "Self"
+            else:
+                # Unenrolled family member identified by name:
+                # Do NOT map to purchasing customer's ID!
+                wearer_cust_id = None
 
     print(f"✔ Pair Recipient: {member_name} (Persisted for_customer_id: {wearer_cust_id})")
 
@@ -228,7 +283,8 @@ def run_checkout(
     f_vid = frame_variant_id
     if not f_vid:
         if auto_confirm:
-            f_vid = 91000001
+            print("✖ Error: Missing required argument '--frame' for non-interactive checkout.")
+            return 1
         else:
             print("Popular Frames:")
             print("  • 91000001 — Eluno Atelier Cat-eye 01 (₹12,998.00)")
@@ -246,10 +302,10 @@ def run_checkout(
         print(f"✖ Frame variant {f_vid} not found in catalogue.")
         return 1
 
-    f_meta = frame_var.get("eluno", {})
-    f_hsn = f_meta.get("hsn") or frame_var.get("hsn")
+    f_meta = frame_var.get("eluno") or {}
+    f_hsn = f_meta.get("hsn")
     if not f_hsn:
-        print(f"✖ Error: Frame variant {f_vid} is missing mandatory HSN metadata in catalogue.")
+        print(f"✖ Error: Frame variant {f_vid} is missing mandatory HSN code in 'variant.eluno.hsn'.")
         return 1
 
     f_price_paise = parse_to_paise(frame_var["price"])
@@ -259,7 +315,8 @@ def run_checkout(
     l_vid = lens_variant_id
     if not l_vid:
         if auto_confirm:
-            l_vid = 91000050 if "campaign" in (customer.tags or "") else 91000041
+            print("✖ Error: Missing required argument '--lens' for non-interactive checkout.")
+            return 1
         else:
             print("\nAvailable Lenses:")
             print("  • 91000041 — Single Vision 1.50 Standard (₹999.00)")
@@ -278,10 +335,10 @@ def run_checkout(
         print(f"✖ Lens variant {l_vid} not found in catalogue.")
         return 1
 
-    l_meta = lens_var.get("eluno", {})
-    l_hsn = l_meta.get("hsn") or lens_var.get("hsn")
+    l_meta = lens_var.get("eluno") or {}
+    l_hsn = l_meta.get("hsn")
     if not l_hsn:
-        print(f"✖ Error: Lens variant {l_vid} is missing mandatory HSN metadata in catalogue.")
+        print(f"✖ Error: Lens variant {l_vid} is missing mandatory HSN code in 'variant.eluno.hsn'.")
         return 1
 
     l_price_paise = parse_to_paise(lens_var["price"])
@@ -329,6 +386,7 @@ def run_checkout(
         pair_ref=pair_id,
         rx_id=selected_rx.rx_id if selected_rx else None,
         for_customer_id=wearer_cust_id,
+        wearer_name=member_name,
     )
     lens_line = CartLine(
         line_id="line_lens_1",
@@ -345,6 +403,7 @@ def run_checkout(
         coating=l_coating,
         rx_id=selected_rx.rx_id if selected_rx else None,
         for_customer_id=wearer_cust_id,
+        wearer_name=member_name,
     )
     cart = Cart(lines=[frame_line, lens_line], customer=customer)
     print(f"✔ Frame and Lens successfully linked under pair reference: '{pair_id}' for recipient '{member_name}'.")
@@ -438,7 +497,7 @@ def run_checkout(
     # =========================================================================
     print("\n--- Step 12: Staff Authorization & Confirmation Gate ---")
     if not auto_confirm:
-        confirmed = prompt_confirm(f"Capture payment of {format_inr(session.cart.net_total_paise)} on UPI/Card terminal?", default=True)
+        confirmed = prompt_confirm(f"Capture payment of {format_inr(session.cart.net_total_paise)} on UPI/Card terminal?", default=False)
         if not confirmed:
             print("\n✖ Payment cancelled by staff. Marking allocated invoice sequence as CANCELLED...")
             ctx.repo.update_invoice_status(session.invoice.invoice_no, InvoiceStatus.CANCELLED)
@@ -462,8 +521,8 @@ def run_checkout(
             ("Shopify Order ID", result.shopify_order_id),
             ("Shopify Order #", result.shopify_order_number or result.shopify_order_id),
             ("Total Paid (INR)", format_inr(result.net_payable_paise)),
-            ("Recipient", member_name),
-            ("Persisted for_customer_id", str(wearer_cust_id)),
+            ("Recipient", member_name or "Self"),
+            ("Persisted for_customer_id", str(wearer_cust_id) if wearer_cust_id is not None else "None (Unenrolled)"),
             ("Operating Staff", f"{staff_member['name']} ({staff_member['staff_id']})"),
         ]
         print_card("Official Store Receipt", receipt_items)
