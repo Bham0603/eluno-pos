@@ -1,18 +1,18 @@
 # Eluno POS — Omnichannel Retail Point of Sale
 
 [![Python Version](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
-[![Test Suite](https://img.shields.io/badge/tests-186%20passed-brightgreen.svg)]()
+[![Test Suite](https://img.shields.io/badge/tests-213%20passed-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
 
-> **Production-grade, domain-driven retail point-of-sale system engineered specifically for optical retail stores.**  
-> Built to replace Shopify POS at the till across Eluno's retail stores, integrating clinical prescription validation, automated offer stacking, exact-paisa GST calculation, resilient terminal payments, durable SQLite audit ledgers, full returns with credit notes, and store day-end reconciliation.
+> **Technical Assessment Prototype & Reference Implementation for Optical Retail.**  
+> Engineered as a domain-driven prototype to evaluate replacing Shopify POS at the till across Eluno's retail stores. Integrates clinical prescription validation, automated offer stacking from data, exact-paisa GST calculation, resilient terminal payments, durable SQLite audit ledgers, full returns with credit notes and targeted restock, and store day-end reconciliation against local mock APIs.
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview & Problem Statement](#1-project-overview--problem-statement)
-2. [Key Features Implemented (Must Requirements)](#2-key-features-implemented-must-requirements)
+2. [Scope Audit: Must, Should, and Stretch Requirements](#2-scope-audit-must-should-and-stretch-requirements)
 3. [System Architecture](#3-system-architecture)
    - [CLI Layer](#cli-layer-eluno_poscli)
    - [Domain Layer](#domain-layer-eluno_posdomain)
@@ -34,8 +34,8 @@
 9. [Important Engineering Decisions](#9-important-engineering-decisions)
    - [Integer Paise Arithmetic & Deterministic GST](#a-integer-paise-arithmetic--deterministic-gst-calculation)
    - [Pure Data Offer Evaluation & Stacking](#b-pure-data-offer-evaluation--stacking)
-   - [Payment Safety & Distributed Reconciliation](#c-payment-safety--distributed-reconciliation)
-   - [Decoupled Domain with Shopify as System of Record](#d-decoupled-domain-with-shopify-as-system-of-record)
+   - [Durable Outbox & Reconciled Transaction Workflow (Not 2PC)](#c-durable-outbox--reconciled-transaction-workflow-not-2pc)
+   - [Decoupled Domain & Shopify Schema Alignment](#d-decoupled-domain--shopify-schema-alignment)
 10. [Deferred to Version 1.1](#10-deferred-to-version-11)
 11. [Known Limitations & Production Dependencies](#11-known-limitations--production-dependencies)
 12. [Documentation & Architectural References](#12-documentation--architectural-references)
@@ -57,22 +57,48 @@ Eluno previously operated billing on standard **Shopify POS**, which introduced 
 4. **GST Rounding Inconsistencies:** Retail eyewear prices are inclusive of GST across varying HSN categories (Frames @ 18%, Prescription Lenses @ 5%). Decimal float arithmetic and independent tax component rounding produced fractional paisa drift across receipts.
 5. **Lack of Operational Reporting:** No dependable day-end store report reconciled local cash/terminal receipts with Shopify cloud orders and HSN tax splits.
 
-### The Solution: Eluno POS v1
-**Shopify remains the authoritative system of record** for customer accounts, product catalog, inventory levels, order history, and payment transactions. **Eluno POS v1** replaces the till application with a high-performance, domain-driven point of sale that enforces clinical compatibility, automates promotional stacking, guarantees exact-paisa tax math, executes two-phase payment and inventory reconciliation, and provides robust statutory auditing.
+### The Solution: Eluno POS Assessment Prototype
+**Shopify remains the authoritative system of record** for customer accounts, product catalog, inventory levels, order history, and payment transactions. **Eluno POS** is a technical assessment prototype engineered to evaluate replacing the till application with a domain-driven point of sale that communicates with simulated upstream services via local mock APIs (`http://localhost:8787`). It enforces clinical compatibility, automates promotional stacking from data, guarantees exact-paisa tax math, executes durable terminal payment and state reconciliation, and provides robust statutory auditing. (Upstream integrations currently target the starter-kit mock server; production deployment requires establishing real credentials, hardware drivers, and compliance services detailed in [§11](#11-known-limitations--production-dependencies)).
 
 ---
 
-## 2. Key Features Implemented (Must Requirements)
+## 2. Scope Audit: Must, Should, and Stretch Requirements
 
-| # | Must Requirement | Implementation & Architectural Details |
+The table below provides a complete, transparent audit of all requirements defined in `brief/CANDIDATE_BRIEF.md` and `brief/STAKEHOLDER_THREAD.md`, declaring exact implementation status, architectural details, and deferred boundaries.
+
+### A. Must Requirements (Core Till Capabilities) — 100% IMPLEMENTED
+
+| # | Requirement | Status | Implementation & Architectural Details |
+|---|---|---|---|
+| **1** | **Customer & Prescription Lookup** | **IMPLEMENTED** | Queries Shopify for customer profiles by phone; retrieves clinical optical prescriptions from the Store Management Tool (SMT) API (`/smt/prescriptions`). Parses customer tags (`priority`, `family`, `campaign`). Strictly enforces **clinical privacy data minimization**: displays governance metadata (Rx ID, test date, optometrist, validity status, reading ADD presence) while concealing raw refractive powers (SPH, CYL, AXIS, PD) on frontline screens. |
+| **2** | **Cart & Lens Matrix Validation** | **IMPLEMENTED** | Implements `LensValidator` to cross-validate clinical prescription parameters against lens index geometry (`rx_limits`). Enforces spherical (SPH) and cylindrical (CYL) boundaries, mandates near-vision reading `ADD` power for progressive/bifocal lenses, and verifies axis alignment. Invalid picks are blocked with clear, actionable staff prompts before invoice creation. |
+| **3** | **Automated Offer Engine** | **IMPLEMENTED** | Evaluates date-effective promotional rules from `offers.json` across product, category, pair, and cart tiers. Automatically selects the optimal combination that maximizes customer savings while strictly respecting exclusivity constraints (`allow_stacking: false`). Floor manager overrides (capped at 10%) require non-repudiable manager `staff_id` verification (`can_override_discount: true`) and a mandatory, validated audit reason code (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`). |
+| **4** | **Date-Effective GST Engine** | **IMPLEMENTED** | Computes exact backward GST extraction from inclusive Maximum Retail Price (MRP) across 5 statutory HSN categories in `tax_rates.json`: Frames (HSN `90031900` @ 18%), Lenses (HSN `90015000` @ 5% post-Sept 2025; 12% prior), Sunglasses (HSN `90049000` @ 18%), Corrective Spectacles (HSN `90041000` @ 5%), and Services (HSN `998599` @ 18%). Guarantees $	ext{Taxable} + 	ext{CGST} + 	ext{SGST} = 	ext{Net Line Amount}$ to the exact paisa with zero rounding drift. |
+| **5** | **Durable Order Creation & Payment** | **IMPLEMENTED** | Durable workflow: records a local transaction intent (`DRAFT`), dispatches an idempotent charge to the payment terminal gateway (`POST /terminal/charges`, with `order_ref = invoice_no`), transitions to `PENDING_RECONCILIATION`, allocates a gapless sequential tax invoice (`ELU/{STORE}/{FY}/{SEQ}`) with dynamic Indian Financial Year derivation (April 1 – March 31), and submits the order to the Shopify Admin API carrying line attributes (`pair_ref`, `rx_id`, `hsn`, `for_customer_id`, `wearer_name`) and store invoice numbers in `note_attributes`. Recovers safely via reconciliation without duplicate charges or orphaned orders. |
+| **6** | **Full Refund & Targeted Restock** | **IMPLEMENTED** | Reverses completed sales end-to-end: verifies operating staff against SMT store registry, executes an atomic concurrency check (`BEGIN IMMEDIATE`), verifies terminal refund baseline, issues payment reversal on the terminal (`POST /terminal/charges/{id}/refunds`), allocates a sequential credit note (`ELU/{STORE}/{FY}/CN/{SEQ}`), restocks physical frames (+1 unit at billing store location), marks custom lenses as scrapped (`no_restock`), and posts line-level GST reversal to Shopify. |
+| **7** | **Day-End Store Reconciliation Report** | **IMPLEMENTED** | Generates consolidated daily settlement reports for store and date from Shopify cloud orders: aggregates gross sales, discounts given, net revenue, completed refunds, and net store revenue. Computes itemized HSN tax breakdown (Gross Taxable, Gross GST, Refund Taxable, Refund GST Reversal, Net Taxable, Net GST Payable), payment method split (UPI, Card, Cash), sales channels, and flags cloud discrepancies against live Shopify orders. |
+
+### B. Should Requirements (Operational Enhancements)
+
+| # | Requirement | Status | Current Reality & Scope Boundary |
+|---|---|---|---|
+| **1** | **Cash Till Sessions & Drawer Tracking** | **PARTIALLY IMPLEMENTED** | Core domain entities for till sessions, float balance, and cash movements exist in `eluno_pos/domain/`. Till reconciliation report math is integrated into the reporting service. Interactive CLI till session workflows (prompting opening float, mid-day petty cash paid-outs for tea/courier, paid-ins, and closing counted variance checks) are deferred to v1.1. |
+| **2** | **Sales Channel Attribution & Reporting** | **PARTIALLY IMPLEMENTED** | Day-end store reporting filters and aggregates sales channels from Shopify orders (`walk_in`, `whatsapp_booked`, `online_pickup`). Till checkout currently defaults to `channel="walk_in"`. Interactive till-side selection of `whatsapp_booked` and `online_pickup` at the point of sale is deferred to v1.1. |
+| **3** | **Partial Refund (Frame-only or Lens-only)** | **DEFERRED** | V1 implements complete, atomic full returns with credit notes and targeted restock. Granular item-level returns (e.g. customer keeping frame but returning lenses for remake credit) are deferred to v1.1. |
+| **4** | **Printable Invoice (HTML or PDF)** | **DEFERRED** | V1 implements rich, formatted Unicode terminal inspection cards for tax invoices and receipts (`invoice show` and post-checkout receipt card). Standalone HTML/PDF invoice generation and native ESC/POS thermal printer communication are deferred to v1.1. |
+| **5** | **Staff Audit Trail with Mandatory Reason Codes** | **IMPLEMENTED** | Mandatory, validated reason codes are strictly enforced for both manager discount overrides (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`) and full store returns (`CUSTOMER_RETURN`, `DEFECTIVE_FRAME`, `INCORRECT_PRESCRIPTION`). Operating staff ID is verified against the SMT registry. |
+
+### C. Stretch Requirements & Stakeholder Clarifications
+
+| Feature / Request | Status | Architectural Scope Boundary |
 |---|---|---|
-| **1** | **Customer & Prescription Lookup** | Queries Shopify for customer profiles by phone; retrieves clinical optical prescriptions from the Store Management Tool (SMT) API (`/smt/prescriptions`). Parses customer tags (`priority`, `family`, `campaign`). Strictly enforces **clinical privacy data minimization**: displays governance metadata (Rx ID, test date, optometrist, validity status, reading ADD presence) while concealing raw refractive powers (SPH, CYL, AXIS, PD) on frontline screens. |
-| **2** | **Cart & Lens Matrix Validation** | Implements `LensValidator` to cross-validate clinical prescription parameters against lens index geometry (`rx_limits`). Enforces spherical (SPH) and cylindrical (CYL) boundaries, mandates near-vision reading `ADD` power for progressive/bifocal lenses, and verifies axis alignment. Invalid picks are blocked with clear, actionable staff prompts before invoice creation. |
-| **3** | **Automated Offer Engine** | Evaluates date-effective promotional rules from `offers.json` across product, category, pair, and cart tiers. Automatically selects the optimal combination that maximizes customer savings while strictly respecting exclusivity constraints (`allow_stacking: false`). Supports store manager discount overrides (capped at 10%) requiring non-repudiable manager `staff_id` verification and mandatory audit reason codes. |
-| **4** | **Date-Effective GST Engine** | Computes exact backward GST extraction from inclusive Maximum Retail Price (MRP) across 5 statutory HSN categories in `tax_rates.json`: Frames (HSN `90031900` @ 18%), Lenses (HSN `90015000` @ 5% post-Sept 2025; 12% prior), Sunglasses (HSN `90049000` @ 18%), Corrective Spectacles (HSN `90041000` @ 5%), and Services (HSN `998599` @ 18%). Guarantees $\text{Taxable} + \text{CGST} + \text{SGST} = \text{Net Line Amount}$ to the exact paisa with zero rounding drift. |
-| **5** | **Durable Order Creation & Payment** | Two-phase transaction flow: dispatches an idempotent charge to the payment terminal gateway (`POST /terminal/charges`), allocates a gapless sequential tax invoice (`ELU/{STORE}/{FY}/{SEQ}`) with dynamic Indian Financial Year derivation (April 1 – March 31), and submits the order to the Shopify Admin API carrying line attributes (`pair_ref`, `rx_id`, `hsn`, `for_customer_id`, `wearer_name`) and store invoice numbers in `note_attributes`. |
-| **6** | **Full Refund & Targeted Restock** | Reverses completed sales end-to-end: verifies operating staff against SMT store registry, executes an atomic concurrency check (`BEGIN IMMEDIATE`), verifies terminal refund baseline, issues payment reversal on the terminal (`POST /terminal/charges/{id}/refunds`), allocates a sequential credit note (`ELU/{STORE}/{FY}/CN/{SEQ}`), restocks physical frames (+1 unit at billing store location), marks custom lenses as scrapped (`no_restock`), and posts line-level GST reversal to Shopify. |
-| **7** | **Day-End Store Reconciliation Report** | Generates consolidated daily settlement reports for store and date: aggregates gross sales, discounts given, net revenue, completed refunds, and net store revenue. Computes itemized HSN tax breakdown (Gross Taxable, Gross GST, Refund Taxable, Refund GST Reversal, Net Taxable, Net GST Payable), payment method split (UPI, Card, Cash), sales channels, and flags cloud discrepancies against live Shopify orders. |
+| **Offer Authoring from Plain English (NLP)** | **DEFERRED** | Natural language prompt compilation into validated JSON promotional rules is deferred. Promotional rules are maintained in structured, pure-data format in `starter-kit/data/offers.json`. |
+| **Prescription Entry Assist (Computer Vision)** | **DEFERRED** | OCR / photo-to-structured Rx extraction is deferred. Prescriptions are retrieved digitally from SMT (`/smt/prescriptions`). |
+| **Billing-Time Anomaly Flags** | **DEFERRED** | Diagnostic anomaly detection (e.g. >1.00 D jump across tests, first-time progressive warnings) is deferred. |
+| **Single-Pair Wearer Attribution** | **IMPLEMENTED** | Supports attributing a pair to a specific wearer/recipient via `--for-member` (name string) and `--for-customer-id` (persisted integer customer ID). Line attributes carry `wearer_name` and `for_customer_id` without polluting purchaser identity. |
+| **Multi-Pair Single-Invoice Family Checkout** | **DEFERRED** | Multi-pair single-invoice checkout with multiple distinct clinical prescriptions (e.g. family of three with three different prescriptions on one invoice) is deferred to v1.1. Single-pair checkout is fully supported. |
+| **Laboratory Remake Management** | **DEFERRED** | Commercial liability allocation (lab manufacturing defect vs. store optometrist measurement error vs. customer intolerance) and zero-charge replacement lens billing are deferred to v1.1. |
+| **Automated 10:00 AM Daily Email Digest** | **DEFERRED** | Scheduled email reporting is an infrastructure cron service responsibility querying Shopify Admin API directly, outside the frontline POS till client. |
 
 ---
 
@@ -207,7 +233,7 @@ eluno-pos/
 │       ├── prescription_service.py
 │       ├── refund_service.py
 │       └── shopify_order_service.py
-└── tests/                           # Complete automated test suite (186 tests)
+└── tests/                           # Complete automated test suite (213 tests across 20 modules)
     ├── test_checkout_flow.py
     ├── test_cli.py
     ├── test_cli_e2e.py
@@ -218,6 +244,7 @@ eluno-pos/
     ├── test_invoice_repository.py
     ├── test_lens_validation.py
     ├── test_mock_integration.py
+    ├── test_mock_server_status.py
     ├── test_offer_service.py
     ├── test_pairing.py
     ├── test_payment_service.py
@@ -307,7 +334,7 @@ python -m eluno_pos customer lookup --phone +919000000001
 Executes the guided 15-step retail optical checkout lifecycle.
 
 **Non-Interactive Scripted Execution (`--yes`):**
-Requires complete explicit transaction inputs (`--store`, `--staff`, `--customer`, `--frame`, `--lens`); no silent demo defaults are assumed:
+Requires complete explicit transaction inputs (`--store`, `--staff`, `--customer`, `--frame`, `--lens`); no silent demo defaults are assumed. Attributing a pair to a family member is supported via `--for-member` and `--for-customer-id` (multi-pair family checkout with distinct prescriptions on one invoice is deferred to v1.1). Channel defaults to `walk_in`. Receipts are rendered as structured terminal cards (physical ESC/POS thermal printing and HTML/PDF invoices are deferred):
 ```powershell
 python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 --frame 91000001 --lens 91000041 --yes
 ```
@@ -319,7 +346,7 @@ python -m eluno_pos checkout
 ```
 
 ### 4. Tax Invoice Document Inspection
-Displays the official store tax invoice, itemized line items, applied promotional discounts, HSN tax breakdown, and payment audit details:
+Displays the formatted store tax invoice inspection document in the terminal, detailing itemized line items, applied promotional discounts, HSN tax breakdown, and payment audit details (standalone HTML/PDF export is deferred to v1.1):
 ```powershell
 python -m eluno_pos invoice show --invoice ELU/HSR/FY27/00001
 ```
@@ -352,13 +379,13 @@ The repository contains an exhaustive automated test suite covering unit math, s
 ```powershell
 python -m pytest tests/ -q
 ```
-**Result:** `186 passed in ~3 minutes`
+**Result:** `213 passed in ~4.5 minutes`
 
 ### Running with Standard Library Unittest
 ```powershell
 python -m unittest discover -s tests -v
 ```
-**Result:** `Ran 186 tests ... OK`
+**Result:** `Ran 213 tests ... OK`
 
 ### Test Suite Structure
 | Test Module | Focus Area |
@@ -372,6 +399,7 @@ python -m unittest discover -s tests -v
 | `test_invoice_repository.py` | SQLite schema, WAL mode, foreign keys, gapless sequences, and state transitions. |
 | `test_day_end_service.py` | Multi-system financial aggregation, payment splits, and Shopify cloud discrepancy detection. |
 | `test_http_client.py` | Resilient HTTP transport, exponential backoff, and full jitter for 429 and 503 errors. |
+| `test_mock_integration.py` & `test_mock_server_status.py` | Multi-service integration flows, mock server order filtering, IST date filtering, and status codes. |
 | `test_cli.py` & `test_cli_e2e.py` | Command routing, argument validation, privacy minimization, and end-to-end user journeys. |
 
 ---
@@ -389,15 +417,20 @@ python -m unittest discover -s tests -v
 - **Customer Benefit Optimization:** The offer engine evaluates product, category, pair, and cart-level rules. If a non-stackable offer yields greater savings than a combination of stackable offers, the engine automatically selects the configuration maximizing customer savings.
 - **Audited Manager Overrides:** Floor managers can grant discretionary overrides capped at 10% (1000 bps). Overrides require an authorizing manager's `staff_id` (verified against `can_override_discount: true` in `staff.json`) and a mandatory reason code (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`). Shared PINs are completely prohibited.
 
-### C. Payment Safety & Distributed Reconciliation
-- **Two-Phase Commit Pattern:** A local transaction intent is recorded with a generated invoice number before contacting the payment gateway. The charge request sends `order_ref = invoice_no` as an idempotency key.
-- **Durable `PENDING_RECONCILIATION` State:** Upon terminal payment confirmation, the local invoice transitions to `PENDING_RECONCILIATION`. If the network drops or Shopify times out during order creation, the transaction is **never marked as cancelled or deleted**. The invoice number is never reused.
-- **Safe Recovery:** Automated reconciliation checks Shopify cloud orders by store location and matching `note_attributes` to recover state without ever replaying non-idempotent payment charges or creating duplicate orders.
+### C. Durable Outbox & Reconciled Transaction Workflow (Not 2PC)
+- **Durable Intent & Idempotency (Not Two-Phase Commit):** The application does not execute a distributed Two-Phase Commit (2PC) protocol across heterogeneous external systems, as Shopify Admin API and the payment terminal do not support XA/prepare-commit coordinators. Instead, it implements a resilient saga/outbox transaction pattern:
+  1. A local transaction intent is recorded in SQLite with status `DRAFT` and a newly allocated store sequential invoice number (`ELU/{STORE}/{FY}/{SEQ}`).
+  2. The payment charge is dispatched to the terminal gateway with `order_ref = invoice_no` as an idempotency key.
+  3. Upon terminal payment capture, the local invoice immediately transitions to `PENDING_RECONCILIATION`.
+  4. The paid order is submitted to Shopify Admin API carrying the invoice number and store code in `note_attributes`. Upon confirmed order creation, the invoice transitions to `POSTED`.
+- **Durable `PENDING_RECONCILIATION` State:** If the store Wi-Fi drops, Shopify times out, or returns a 503 during order creation, the transaction is **never marked as cancelled or deleted** (as customer funds are already captured). The invoice number is never reused or orphaned.
+- **Safe State Recovery:** The `reconcile` routine queries Shopify cloud orders by store location and inspects `note_attributes` to recover state. If Shopify created the order prior to network loss, the local invoice transitions to `POSTED`; if uncreated, the order is safely submitted without re-charging the customer's payment card.
 - **Atomic Concurrency for Refunds:** Refund operations acquire a `BEGIN IMMEDIATE` SQLite transaction lock. Concurrent refund requests for the same invoice are rejected safely. Durably stored baseline `refunded_paise` ensures ambiguous terminal responses cannot cause double-refunds.
 
-### D. Decoupled Domain with Shopify as System of Record
-- **Domain Independence:** The domain layer defines its own agnostic models (`Cart`, `Invoice`, `Customer`, `Prescription`). External systems (Shopify, SMT, Terminal) are reached exclusively through adapter boundaries. If Shopify is migrated or replaced in the future, domain logic remains completely untouched.
-- **Lineage Properties:** Custom prescription lenses carry minimal tracking tokens (`pair_ref`, `rx_id`, `for_customer_id`, `wearer_name`) in Shopify line item properties, enabling downstream laboratory Order Management Systems (OMS) to match frames and lenses without exposing raw optical measurements on public platforms.
+### D. Decoupled Domain & Shopify Schema Alignment
+- **Domain Independence:** The domain layer defines its own agnostic value objects and models (`Cart`, `Invoice`, `Money`, `LensLimits`, `TaxRate`). Domain logic operates independently of external API SDKs, ORMs, or Shopify-specific data structures.
+- **Shopify Schema Alignment in Adapters:** While domain entities are decoupled, `ShopifyOrderService` and adapter layers intentionally structure payloads, tax lines, note attributes (`store_code`, `invoice_no`), and line item properties (`pair_ref`, `rx_id`, `for_customer_id`, `wearer_name`, `channel`) to strictly match Shopify Admin REST API specifications. Complete provider independence would require an additional intermediate abstraction layer if migrating away from Shopify.
+- **Lineage & Privacy Protection:** Custom prescription lenses carry minimal tracking tokens in Shopify line item properties, enabling downstream laboratory Order Management Systems (OMS) to match frames and lenses without exposing raw clinical optical measurements on public platforms.
 
 ---
 
@@ -405,45 +438,50 @@ python -m unittest discover -s tests -v
 
 In accordance with the project scope matrix and stakeholder agreements, the following non-blocking capabilities are formally deferred to Version 1.1:
 
-1. **Cash Till Sessions & Physical Drawer Tracking (Should):**
-   - Opening float balance entry.
+1. **Multi-Pair Single-Invoice Family Checkout (Stakeholder Request):**
+   - Single-pair wearer attribution (`for_customer_id`, `wearer_name`) is implemented.
+   - Multi-pair single-invoice checkout with multiple distinct clinical prescriptions (e.g. family of three with 3 different prescriptions on one invoice) is deferred.
+2. **Cash Till Interactive Sessions & Physical Drawer Tracking (Should):**
+   - Interactive opening float balance entry workflow.
    - Petty cash drop recording (paid-ins and paid-outs for local store expenses like tea, courier).
-   - End-of-shift physical counted cash reconciliation and cash variance reporting.
-2. **Sales Channel Attribution (Should):**
-   - Tagging transactions at checkout with explicit sales channels (`walk_in`, `whatsapp_booked`, `online_pickup`).
-   - Store-level sales channel performance reporting.
-3. **Partial Return Workflows (Should):**
-   - Processing partial refunds (e.g. customer returns frame but retains custom-cut lenses, or lens remake credit).
-4. **Laboratory Remake Management (Stretch):**
+   - End-of-shift physical counted cash reconciliation and cash variance reporting (data models and reporting math exist; interactive CLI session workflow deferred).
+3. **Till-Side Sales Channel Selection (Should):**
+   - Interactive selection of sales channels (`whatsapp_booked`, `online_pickup`) at till checkout (currently defaults to `channel="walk_in"`; day-end reporting groups by channel if present on orders).
+4. **Partial Return Workflows (Should):**
+   - Granular item-level returns (e.g. customer returning frame but retaining custom-cut lenses, or lens remake credit). V1 implements complete, atomic full returns.
+5. **Printable Invoices & Physical Hardware Peripheral Drivers (Should):**
+   - Generation of standalone HTML/PDF tax invoice documents.
+   - Direct communication with ESC/POS thermal receipt printers and USB/Bluetooth barcode scanners. (V1 renders structured Unicode terminal inspection cards).
+6. **Laboratory Remake Management (Stakeholder Request):**
    - Commercial liability allocation (lab manufacturing defect vs. store optometrist measurement error vs. customer prescription intolerance).
    - Billing replacement lenses referencing `parent_invoice_no`.
-5. **Cross-Account Family Loyalty:**
+7. **Cross-Account Family Loyalty:**
    - Aggregating loyalty reward tiers across distinct family member phone profiles.
-6. **Automated 10:00 AM Daily Email Digest:**
+8. **Automated 10:00 AM Daily Email Digest:**
    - Standalone scheduled backend cron querying Shopify Admin API to email executive summaries to leadership.
-7. **Hardware Peripheral Drivers:**
-   - Direct serial communication with USB/Bluetooth barcode scanners and ESC/POS thermal receipt printers.
 
 ---
 
 ## 11. Known Limitations & Production Dependencies
 
-Prior to launching Eluno POS v1 in live physical retail stores, the following operational and third-party dependencies must be established:
+Eluno POS is currently engineered and validated as a technical assessment prototype communicating with local mock APIs (`http://localhost:8787`). Prior to deploying in live physical retail stores, the following operational, compliance, and infrastructure prerequisites must be established:
 
-1. **Production Shopify Credentials:**
-   - Requires a dedicated Shopify Custom App access token configured with production scopes: `read_products`, `read_customers`, `read_inventory`, `write_inventory`, `read_orders`, and `write_orders`.
-2. **Production Staff Authentication:**
-   - Transitioning from the local SMT registry to enterprise OAuth2 / OpenID Connect, JWT session tokens, or physical RFID staff badge scanners.
-3. **Statutory GST E-Invoicing & IRN Generation:**
-   - Direct integration with the Government of India Invoice Registration Portal (IRP/NIC) for generating Invoice Reference Numbers (IRN) and signed B2B/B2C QR codes on tax invoices exceeding statutory turnover thresholds.
-4. **Physical Hardware Peripheral Integration:**
-   - Native integration with ESC/POS thermal receipt printers (receipt formatting, logo graphics, paper cutter commands) and USB HID / Bluetooth barcode scanners.
-5. **Cash Drawer Tracking:**
-   - Hardware trigger pulse (RJ11/RJ12 drawer kick-out) on cash sale completion.
-6. **Sales Channel Tagging:**
-   - Omnichannel attribution pipeline linking WhatsApp CRM and appointment booking webhooks.
-7. **Lab Remake Tracking:**
-   - Centralized laboratory remake dispatch workflow.
+1. **Production Shopify Admin API Credentials & Private App:**
+   - Dedicated Shopify Custom App access token with production scopes: `read_products`, `read_customers`, `read_inventory`, `write_inventory`, `read_orders`, and `write_orders`.
+   - Verified API rate-limit tiers (Shopify Plus / standard leaky bucket limits) to support peak retail footfall without throttling.
+2. **Production Payment Terminal Integration:**
+   - Real-world payment gateway SDK/API integration (e.g. Pine Labs Plutus, Razorpay POS, or Innoviti) replacing the local `/terminal` mock.
+   - Hardware card reader / terminal tethering (USB/Ethernet/Wi-Fi) with terminal transaction status webhooks.
+3. **Production Staff Authentication & SSO:**
+   - Transition from the local SMT JSON staff registry to enterprise OAuth2 / OpenID Connect (OIDC), SAML SSO, or biometric/RFID staff login at the till.
+4. **Statutory GST E-Invoicing & IRN Generation:**
+   - Direct API integration with the Government of India Invoice Registration Portal (IRP/NIC or authorized GSP) for generating Invoice Reference Numbers (IRN) and digitally signed B2B/B2C QR codes on tax invoices exceeding statutory turnover thresholds.
+5. **Physical POS Hardware Peripheral Drivers:**
+   - Native serial/USB ESC/POS driver integration for thermal receipt printers (raster graphics, cutter controls).
+   - Cash drawer kick-out interface (RJ11/RJ12 24V solenoid pulse) triggered upon cash sale capture.
+   - USB HID / Bluetooth barcode scanners configured for serial/batch barcode scanning.
+6. **Central Optical Laboratory OMS Webhooks:**
+   - Integration with Eluno's central laboratory Order Management System (OMS) to dispatch frame SKUs, lens geometry, and optical measurements for production upon order creation.
 
 ---
 

@@ -1,12 +1,16 @@
 # Eluno POS — CLI User Guide & Operational Manual
 
-Welcome to the command-line interface for **Eluno POS**, an enterprise retail point-of-sale system engineered specifically for optical retail stores.
+Welcome to the command-line interface for **Eluno POS**, a domain-driven retail point-of-sale technical assessment prototype engineered specifically for optical retail stores.
 
-The Eluno POS CLI integrates the complete architectural lifecycle across customer identification, clinical optical validation, paired inventory checkout, promotion discounting, exact-paisa GST calculation, payment capture via terminal, durable SQLite state transitions, Shopify cloud synchronization, full refunds with credit notes, day-end store audit reporting, and transaction reconciliation.
+The Eluno POS CLI integrates the complete architectural lifecycle across customer identification, clinical optical validation, paired inventory checkout, promotion discounting, exact-paisa GST calculation, payment capture via terminal, durable SQLite state transitions, Shopify cloud synchronization, full refunds with credit notes, day-end store audit reporting, and transaction reconciliation against local mock APIs (`http://localhost:8787`).
 
 ---
 
 ## 1. System Requirements & Setup
+
+> [!NOTE]
+> **Prototype Environment Notice:**  
+> This implementation connects to local mock services running on `http://localhost:8787`. It does not connect to live production Eluno credentials, live payment gateways, or physical store hardware. Production deployment requirements are detailed in [`README.md`](../README.md#11-known-limitations--production-dependencies).
 
 ### Prerequisites
 - **Python**: 3.12+ (tested on Python 3.12 64-bit).
@@ -167,8 +171,9 @@ python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 -
 - `--frame`, `-f`: Shopify Variant ID of the frame (e.g. `91000001`). Must contain `variant.eluno.hsn` metadata.
 - `--lens`, `-l`: Shopify Variant ID of the ophthalmic lens (e.g. `91000041`). Must contain `variant.eluno.hsn` metadata.
 - `--rx`, `-r`: Specific clinical prescription ID to link (e.g. `RX5002`) or `plano`. Must belong to customer and be valid on transaction date.
-- `--for-member`: Recipient name for family billing (persisted as `wearer_name`).
+- `--for-member`: Recipient name for single-pair wearer attribution (persisted as `wearer_name`). Multi-pair single-invoice family checkout with multiple distinct prescriptions is deferred to v1.1.
 - `--for-customer-id`, `--wearer-id`: Persisted integer customer ID of wearer/recipient (kept `None` if unenrolled).
+- Sales Channel: Checkout automatically assigns `channel="walk_in"`. Interactive till-side selection of `whatsapp_booked` and `online_pickup` is deferred to v1.1.
 - `--manager-override`: Manager discount override in basis points (100 bps = 1.00%, max 1000 bps = 10.00%).
 - `--override-reason`: Mandatory reason code for manager override (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`).
 - `--override-manager-id`: Staff ID of authorizing store manager (must have `store_manager` override permissions).
@@ -180,7 +185,7 @@ python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 -
 2. **Staff Store Association**: Validates operating staff against SMT staff records for the active store. Rejects unverified staff or staff registered to other stores.
 3. **Customer Identification**: Looks up profile by phone and pulls customer tags (`priority`, `family`, `campaign`).
 4. **Prescription Safety & Clinical Privacy**: Conceals raw clinical optical measurements (SPH, CYL, AXIS, ADD, PD) from the operator screen. Displays only governance metadata (Rx ID, test date, optometrist/source, validity status, and reading ADD presence). If all prescriptions on file are expired, checkout rejects in `--yes` mode unless `--rx plano` is explicitly authorized; in interactive mode, staff confirmation is required.
-5. **Family Wearer Identity**: Distinguishes between purchaser, enrolled family member with a customer ID (`for_customer_id`), and unenrolled family member by text name (`wearer_name`). Unenrolled members never map to the purchaser's ID.
+5. **Family Wearer Identity**: Distinguishes between purchaser, enrolled family member with a customer ID (`for_customer_id`), and unenrolled family member by text name (`wearer_name`). Unenrolled members never map to the purchaser's ID. Multi-pair family checkout with multiple distinct prescriptions on a single invoice is deferred to v1.1.
 6. **Authoritative HSN Source**: Enforces HSN lookup strictly from `variant.eluno.hsn`. Rejects variants missing documented HSN metadata before invoice allocation.
 7. **Optical Validation (`LensValidator`)**: Checks SPH, CYL, AXIS, and ADD limits against lens geometry.
 8. **Pair Association**: Binds frame and lens under a deterministic `pair_ref` token and persists wearer association.
@@ -190,7 +195,8 @@ python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 -
 12. **Dynamic Financial Year**: Derives invoice financial year dynamically from transaction date using Indian convention (April 1 – March 31, e.g. `FY27` for November 2026).
 13. **Payment Authorization Gate**: Interactive confirmation defaults to `False` (`[y/N]`); pressing Enter cancels payment safely without charging.
 14. **Payment Capture (`PaymentService`)**: Dispatches charge to terminal with durable sequence tracking.
-15. **Cloud Order Sync (`ShopifyOrderService`)**: Creates paid Shopify order with minimized metadata (`rx_id`, `pair_ref`, `hsn`, `for_customer_id`, `wearer_name`).
+15. **Cloud Order Sync (`ShopifyOrderService`)**: Creates paid Shopify order with minimized metadata (`rx_id`, `pair_ref`, `hsn`, `for_customer_id`, `wearer_name`, `channel="walk_in"`).
+16. **Receipt Presentation**: Formats and prints a structured Unicode receipt card to the terminal console. Physical thermal receipt printing via ESC/POS hardware drivers and PDF/HTML generation are deferred to v1.1.
 
 ---
 
@@ -266,7 +272,7 @@ python -m eluno_pos reconcile --store HSR
 ---
 
 ### Command 7: `invoice show` (Tax Invoice Document Inspection)
-Displays the full printable tax invoice document and line item breakdown without exposing sensitive clinical parameters.
+Displays the full formatted tax invoice inspection document and line item breakdown in the terminal without exposing sensitive clinical parameters (HTML/PDF export and physical printing are deferred to v1.1).
 
 ```bash
 python -m eluno_pos invoice show --invoice ELU/HSR/FY27/00001

@@ -2,6 +2,15 @@
 
 Everything here is synthetic but shaped like the real thing. Use it as-is, extend it, or replace it; say what you changed.
 
+> [!NOTE]
+> **Starter Kit Modifications for Assessment:**  
+> In accordance with the instruction to document changes, `mock-apis/mock_server.py` was extended during the assessment to accurately mirror Shopify Admin API behavior:
+> 1. **Order Query Filtering (`GET /orders.json`):** Added timezone-aware ISO-8601 filtering for `created_at_min`, `created_at_max`, `updated_at_min`, `updated_at_max`, `location_id`, and `limit`.
+> 2. **Accurate Order Status Filtering:** Implemented strict Shopify status filtering for `status=any`, `status=open`, `status=closed`, and `status=cancelled` (evaluating `closed_at` and `cancelled_at`), rejecting unsupported status codes with HTTP 400.
+> 3. **Timestamp Maintenance:** Added `updated_at` timestamps to seeded orders and ensured that payment transactions or refunds dynamically refresh `updated_at` to simulate discovery of historical refunds on the current business date.
+> 
+> The core POS application is implemented in [`eluno_pos/`](../eluno_pos/) with operational guides in [`README.md`](../README.md) and [`docs/CLI_GUIDE.md`](../docs/CLI_GUIDE.md).
+
 ```
 data/                        seed JSON in the shapes below (regenerate with generate_seed.py, check with validate_seed.py)
 mock-apis/mock_server.py     one local server, no dependencies, three surfaces: Shopify Admin, store tool, payment terminal
