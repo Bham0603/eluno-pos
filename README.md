@@ -74,7 +74,7 @@ The table below provides a complete, transparent audit of all requirements defin
 | **2** | **Cart & Lens Matrix Validation** | **IMPLEMENTED** | Implements `LensValidator` to cross-validate clinical prescription parameters against lens index geometry (`rx_limits`). Enforces spherical (SPH) and cylindrical (CYL) boundaries, mandates near-vision reading `ADD` power for progressive/bifocal lenses, and verifies axis alignment. Invalid picks are blocked with clear, actionable staff prompts before invoice creation. |
 | **3** | **Automated Offer Engine** | **IMPLEMENTED** | Evaluates date-effective promotional rules from `offers.json` across product, category, pair, and cart tiers. Automatically selects the optimal combination that maximizes customer savings while strictly respecting exclusivity constraints (`allow_stacking: false`). Floor manager overrides (capped at 10%) require non-repudiable manager `staff_id` verification (`can_override_discount: true`) and a mandatory, validated audit reason code (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`). |
 | **4** | **Date-Effective GST Engine** | **IMPLEMENTED** | Computes exact backward GST extraction from inclusive Maximum Retail Price (MRP) across 5 statutory HSN categories in `tax_rates.json`: Frames (HSN `90031900` @ 18%), Lenses (HSN `90015000` @ 5% post-Sept 2025; 12% prior), Sunglasses (HSN `90049000` @ 18%), Corrective Spectacles (HSN `90041000` @ 5%), and Services (HSN `998599` @ 18%). Guarantees $	ext{Taxable} + 	ext{CGST} + 	ext{SGST} = 	ext{Net Line Amount}$ to the exact paisa with zero rounding drift. |
-| **5** | **Durable Order Creation & Payment** | **IMPLEMENTED** | Durable workflow: records a local transaction intent (`DRAFT`), dispatches an idempotent charge to the payment terminal gateway (`POST /terminal/charges`, with `order_ref = invoice_no`), transitions to `PENDING_RECONCILIATION`, allocates a gapless sequential tax invoice (`ELU/{STORE}/{FY}/{SEQ}`) with dynamic Indian Financial Year derivation (April 1 – March 31), and submits the order to the Shopify Admin API carrying line attributes (`pair_ref`, `rx_id`, `hsn`, `for_customer_id`, `wearer_name`) and store invoice numbers in `note_attributes`. Recovers safely via reconciliation without duplicate charges or orphaned orders. |
+| **5** | **Durable Order Creation & Payment** | **IMPLEMENTED** | Durable transaction workflow: atomically allocates a gapless sequential store tax invoice (`ELU/{STORE}/{FY}/{SEQ}`) with dynamic Indian Financial Year derivation (April 1 – March 31), initially persisted in SQLite with status `PENDING_RECONCILIATION`. A payment attempt is separately persisted in SQLite (`payment_attempts`) as `INITIATED` using a stable, unique `order_ref`. The payment charge is dispatched to the terminal gateway (`POST /terminal/charges`); on successful capture, the attempt records `CAPTURED` and stores the gateway `charge_id` (definitive pre-capture failure transitions invoice to `CANCELLED`). A Shopify order intent is recorded in SQLite (`shopify_order_intents`) before submitting the order to Shopify Admin API carrying line attributes (`pair_ref`, `rx_id`, `hsn`, `for_customer_id`, `wearer_name`) and store invoice numbers in `note_attributes`. Confirmed Shopify creation transitions the invoice to `POSTED`. Ambiguous terminal or Shopify outcomes remain `PENDING_RECONCILIATION`. The `reconcile` routine searches Shopify recent orders by location and links a matching existing order by `note_attributes` without automatically resubmitting missing orders or claiming exactly-once guarantees. |
 | **6** | **Full Refund & Targeted Restock** | **IMPLEMENTED** | Reverses completed sales end-to-end: verifies operating staff against SMT store registry, executes an atomic concurrency check (`BEGIN IMMEDIATE`), verifies terminal refund baseline, issues payment reversal on the terminal (`POST /terminal/charges/{id}/refunds`), allocates a sequential credit note (`ELU/{STORE}/{FY}/CN/{SEQ}`), restocks physical frames (+1 unit at billing store location), marks custom lenses as scrapped (`no_restock`), and posts line-level GST reversal to Shopify. |
 | **7** | **Day-End Store Reconciliation Report** | **IMPLEMENTED** | Generates consolidated daily settlement reports for store and date from Shopify cloud orders: aggregates gross sales, discounts given, net revenue, completed refunds, and net store revenue. Computes itemized HSN tax breakdown (Gross Taxable, Gross GST, Refund Taxable, Refund GST Reversal, Net Taxable, Net GST Payable), payment method split (UPI, Card, Cash), sales channels, and flags cloud discrepancies against live Shopify orders. |
 
@@ -82,7 +82,7 @@ The table below provides a complete, transparent audit of all requirements defin
 
 | # | Requirement | Status | Current Reality & Scope Boundary |
 |---|---|---|---|
-| **1** | **Cash Till Sessions & Drawer Tracking** | **PARTIALLY IMPLEMENTED** | Core domain entities for till sessions, float balance, and cash movements exist in `eluno_pos/domain/`. Till reconciliation report math is integrated into the reporting service. Interactive CLI till session workflows (prompting opening float, mid-day petty cash paid-outs for tea/courier, paid-ins, and closing counted variance checks) are deferred to v1.1. |
+| **1** | **Cash Till Sessions & Drawer Tracking** | **DEFERRED** | Sample till session data is provided in the starter kit (`starter-kit/data/till_sessions_sample.json`). Operational cash till sessions, float balance entry, petty cash recording (paid-ins/paid-outs), physical cash drawer tracking, and drawer variance calculation are deferred to v1.1; no application-level till session domain entities or till reporting calculations are implemented in v1. |
 | **2** | **Sales Channel Attribution & Reporting** | **PARTIALLY IMPLEMENTED** | Day-end store reporting filters and aggregates sales channels from Shopify orders (`walk_in`, `whatsapp_booked`, `online_pickup`). Till checkout currently defaults to `channel="walk_in"`. Interactive till-side selection of `whatsapp_booked` and `online_pickup` at the point of sale is deferred to v1.1. |
 | **3** | **Partial Refund (Frame-only or Lens-only)** | **DEFERRED** | V1 implements complete, atomic full returns with credit notes and targeted restock. Granular item-level returns (e.g. customer keeping frame but returning lenses for remake credit) are deferred to v1.1. |
 | **4** | **Printable Invoice (HTML or PDF)** | **DEFERRED** | V1 implements rich, formatted Unicode terminal inspection cards for tax invoices and receipts (`invoice show` and post-checkout receipt card). Standalone HTML/PDF invoice generation and native ESC/POS thermal printer communication are deferred to v1.1. |
@@ -138,7 +138,7 @@ Eluno POS is built using a clean, layered architectural pattern that separates d
 - **100% Decoupled from External APIs:** Free from Shopify REST dependencies, third-party frameworks, or database ORMs.
 - **Value Objects:** `Money` (strict integer paise arithmetic), `TaxRate`, `LensLimits`, `PrescriptionPowers`.
 - **Entities:** `Customer`, `Prescription`, `Cart`, `CartLine`, `Offer`, `Invoice`, `InvoiceLine`, `CreditNote`, `DayEndReport`.
-- **Enums:** `InvoiceStatus` (`DRAFT`, `PENDING_PAYMENT`, `PENDING_RECONCILIATION`, `POSTED`, `CANCELLED`, `REFUNDED`), `RefundStatus` (`INITIATED`, `PENDING`, `COMPLETED`, `FAILED`), `PaymentMethod`, `SalesChannel`.
+- **Enums:** `InvoiceStatus` (`POSTED`, `PENDING_RECONCILIATION`, `CANCELLED`), `PaymentStatus` (`INITIATED`, `CAPTURED`, `FAILED`, `UNKNOWN`), `RefundStatus` (`INITIATED`, `TERMINAL_REFUNDED`, `COMPLETED`, `FAILED`, `PENDING_RECONCILIATION`).
 - **Validators:** `LensValidator` ensuring optical limits and compatibility.
 
 ### Services Layer (`eluno_pos/services/`)
@@ -276,13 +276,17 @@ cd eluno-pos
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 3. Install testing dependencies
+# 3. Install testing dependencies (pytest only)
 python -m pip install --upgrade pip
-python -m pip install pytest python-dotenv
+python -m pip install pytest
 
 # 4. Create local configuration from template
 Copy-Item .env.example .env
 ```
+
+> [!NOTE]
+> **Zero Runtime Dependencies:**  
+> The core application runtime uses only the Python standard library. Configuration is loaded by `eluno_pos/config.py`, which parses `.env` directly without third-party dependencies like `python-dotenv`. `pytest` is the only external dependency, used solely for executing the automated test suite.
 
 ---
 
@@ -418,13 +422,21 @@ python -m unittest discover -s tests -v
 - **Audited Manager Overrides:** Floor managers can grant discretionary overrides capped at 10% (1000 bps). Overrides require an authorizing manager's `staff_id` (verified against `can_override_discount: true` in `staff.json`) and a mandatory reason code (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`). Shared PINs are completely prohibited.
 
 ### C. Durable Outbox & Reconciled Transaction Workflow (Not 2PC)
-- **Durable Intent & Idempotency (Not Two-Phase Commit):** The application does not execute a distributed Two-Phase Commit (2PC) protocol across heterogeneous external systems, as Shopify Admin API and the payment terminal do not support XA/prepare-commit coordinators. Instead, it implements a resilient saga/outbox transaction pattern:
-  1. A local transaction intent is recorded in SQLite with status `DRAFT` and a newly allocated store sequential invoice number (`ELU/{STORE}/{FY}/{SEQ}`).
-  2. The payment charge is dispatched to the terminal gateway with `order_ref = invoice_no` as an idempotency key.
-  3. Upon terminal payment capture, the local invoice immediately transitions to `PENDING_RECONCILIATION`.
-  4. The paid order is submitted to Shopify Admin API carrying the invoice number and store code in `note_attributes`. Upon confirmed order creation, the invoice transitions to `POSTED`.
-- **Durable `PENDING_RECONCILIATION` State:** If the store Wi-Fi drops, Shopify times out, or returns a 503 during order creation, the transaction is **never marked as cancelled or deleted** (as customer funds are already captured). The invoice number is never reused or orphaned.
-- **Safe State Recovery:** The `reconcile` routine queries Shopify cloud orders by store location and inspects `note_attributes` to recover state. If Shopify created the order prior to network loss, the local invoice transitions to `POSTED`; if uncreated, the order is safely submitted without re-charging the customer's payment card.
+- **Durable Intent & Idempotency (Not Two-Phase Commit):** The application does not execute a distributed Two-Phase Commit (2PC) protocol across heterogeneous external systems, as Shopify Admin API and the payment terminal do not support XA/prepare-commit coordinators. Furthermore, it does not claim distributed exactly-once delivery guarantees. Instead, it implements a resilient saga/outbox transaction pattern:
+  1. **Invoice Allocation (`PENDING_RECONCILIATION`):** An invoice is atomically allocated in SQLite using `BEGIN IMMEDIATE` and initially persisted with status `PENDING_RECONCILIATION` and a unique sequential store invoice number (`ELU/{STORE}/{FY}/{SEQ}`).
+  2. **Payment Attempt Initiation (`INITIATED`):** A payment attempt record is separately persisted in SQLite (`payment_attempts`) with status `INITIATED` using a stable, unique `order_ref` (tied to the invoice).
+  3. **Terminal Payment Capture:** The payment charge is dispatched to the terminal gateway using the stable `order_ref` as an idempotency key.
+     - On successful terminal capture, the payment attempt records `CAPTURED` and durably stores the gateway `charge_id`.
+     - On definitive pre-capture failure (e.g., card declined or aborted before terminal capture), the invoice transitions to `CANCELLED`.
+     - On ambiguous terminal outcomes (e.g., socket timeout), the invoice remains in `PENDING_RECONCILIATION`.
+  4. **Shopify Order Intent (`PENDING`):** Before calling Shopify Admin API, a Shopify order intent is recorded in SQLite (`shopify_order_intents`) with status `PENDING`.
+  5. **Shopify Order Creation:** The paid order is submitted to Shopify Admin API carrying the store invoice number and store code in `note_attributes`.
+     - Upon confirmed order creation, the intent is updated to `COMPLETED` and the invoice transitions to `POSTED`.
+     - If Shopify order creation encounters an ambiguous outcome (network drop, timeout, or 503), the intent is marked `AMBIGUOUS` and the invoice remains in `PENDING_RECONCILIATION`.
+- **Durable `PENDING_RECONCILIATION` State:** Under no circumstances is a paid invoice marked `CANCELLED` or deleted when an upstream sync is ambiguous (as customer funds have already been captured). The invoice number is never reused or orphaned.
+- **Payment Recovery via Reconciliation:** The `reconcile` routine queries recent Shopify cloud orders for that store location and inspects `note_attributes` for matching `invoice_no` or `checkout_ref`.
+  - If a matching existing order is found in Shopify, reconciliation links the `shopify_order_id`, marks the intent `RECONCILED`, and transitions the invoice to `POSTED`.
+  - If no matching order is found, the transaction remains in `PENDING_RECONCILIATION` for supervisor review. Missing orders are not automatically resubmitted to Shopify, preventing duplicate order placement or inventory decrements.
 - **Atomic Concurrency for Refunds:** Refund operations acquire a `BEGIN IMMEDIATE` SQLite transaction lock. Concurrent refund requests for the same invoice are rejected safely. Durably stored baseline `refunded_paise` ensures ambiguous terminal responses cannot cause double-refunds.
 
 ### D. Decoupled Domain & Shopify Schema Alignment
@@ -441,10 +453,12 @@ In accordance with the project scope matrix and stakeholder agreements, the foll
 1. **Multi-Pair Single-Invoice Family Checkout (Stakeholder Request):**
    - Single-pair wearer attribution (`for_customer_id`, `wearer_name`) is implemented.
    - Multi-pair single-invoice checkout with multiple distinct clinical prescriptions (e.g. family of three with 3 different prescriptions on one invoice) is deferred.
-2. **Cash Till Interactive Sessions & Physical Drawer Tracking (Should):**
+2. **Cash Till Sessions & Physical Drawer Tracking (Should):**
+   - Sample till session data exists in starter-kit (`starter-kit/data/till_sessions_sample.json`).
    - Interactive opening float balance entry workflow.
    - Petty cash drop recording (paid-ins and paid-outs for local store expenses like tea, courier).
-   - End-of-shift physical counted cash reconciliation and cash variance reporting (data models and reporting math exist; interactive CLI session workflow deferred).
+   - End-of-shift physical counted cash reconciliation and cash variance reporting.
+   - Operational cash till functionality is deferred to v1.1; no application-level till domain entities or till reporting calculations are implemented in v1.
 3. **Till-Side Sales Channel Selection (Should):**
    - Interactive selection of sales channels (`whatsapp_booked`, `online_pickup`) at till checkout (currently defaults to `channel="walk_in"`; day-end reporting groups by channel if present on orders).
 4. **Partial Return Workflows (Should):**

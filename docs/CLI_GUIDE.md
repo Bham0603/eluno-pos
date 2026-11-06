@@ -265,7 +265,7 @@ python -m eluno_pos reconcile --store HSR
 **Recovery Mechanisms:**
 - **Terminal Payment Verification**: Queries payment terminal gateway by actual `charge_id` and checks status (never creates duplicate charges).
 - **Refund Baseline Re-evaluation**: Compares `refunded_paise` against durable `baseline_refunded_paise` to verify whether refund already executed on terminal before allocating credit notes.
-- **Shopify Cloud Reconciliation**: Matches Shopify orders using persisted invoice metadata (`store_code`, `invoice_no`, `checkout_ref`).
+- **Shopify Cloud Reconciliation**: Matches Shopify orders using persisted invoice metadata (`store_code`, `invoice_no`, `checkout_ref`). If found, links the Shopify order and marks the invoice `POSTED`; if not found, leaves the transaction pending reconciliation without automatic order resubmission or duplicate charges.
 - **Location Integrity**: Restocks frames at the original invoice's persisted location ID. If missing, leaves operation pending for supervisor resolution.
 - **Credit Note Allocation**: Allocates credit note numbers sequentially only upon verified terminal capture.
 

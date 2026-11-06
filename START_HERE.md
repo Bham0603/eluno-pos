@@ -28,13 +28,16 @@ cd eluno-pos
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# Install required dependencies
+# Install required testing dependencies (pytest only)
 python -m pip install --upgrade pip
-python -m pip install pytest python-dotenv
+python -m pip install pytest
 
 # Initialize local configuration
 Copy-Item .env.example .env
 ```
+
+> [!NOTE]
+> The core application runtime uses only the Python standard library; `eluno_pos/config.py` loads `.env` directly without external packages like `python-dotenv`. `pytest` is required only for executing the test suite.
 
 ### Step 2: Start Mock Server (Terminal 1)
 In a dedicated PowerShell window, start the starter-kit mock server (deterministic mode):
@@ -83,7 +86,7 @@ python -m eluno_pos reconcile --store HSR
 | Tier | Status | Details |
 |---|---|---|
 | **Must (1–7)** | **100% IMPLEMENTED** | Customer/Rx lookup, optical lens matrix validation, data-driven offer engine, date-effective GST by HSN, durable terminal charge & Shopify order sync with sequential store invoice numbers, full refunds with frame restock / lens scrap, day-end reporting from Shopify orders. |
-| **Should** | **PARTIAL / DEFERRED** | Mandatory staff audit reason codes implemented for overrides and refunds. Cash drawer session tracking and till-side sales channel selection deferred to v1.1. Partial refunds (frame-only/lens-only) and HTML/PDF printing deferred. |
+| **Should** | **PARTIAL / DEFERRED** | Mandatory staff audit reason codes implemented for overrides and refunds. Cash till sessions, cash drawer tracking, and till-side sales channel selection deferred to v1.1. Partial refunds (frame-only/lens-only) and HTML/PDF printing deferred. |
 | **Stretch** | **DEFERRED** | NLP offer authoring, vision prescription entry assist, and billing anomaly detection deferred. |
 
 Refer to [`README.md`](README.md#2-scope-audit-must-should-and-stretch-requirements) for the complete, line-by-line audit matrix.
