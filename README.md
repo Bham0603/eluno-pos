@@ -387,7 +387,7 @@ python -m unittest discover -s tests -v
 ### B. Pure Data Offer Evaluation & Stacking
 - **Zero Code Changes for New Offers:** Promotional rules in `offers.json` are evaluated dynamically.
 - **Customer Benefit Optimization:** The offer engine evaluates product, category, pair, and cart-level rules. If a non-stackable offer yields greater savings than a combination of stackable offers, the engine automatically selects the configuration maximizing customer savings.
-- **Audited Manager Overrides:** Floor managers can grant discretionary overrides capped at 10% (1000 bps). Overrides require an authorizing manager's `staff_id` (verified against `can_override_discount: true` in `staff.json`) and a mandatory reason code (`WALKOUT_RESCUE`, `PRICE_MATCH`, `DAMAGE_ALLOWANCE`). Shared PINs are completely prohibited.
+- **Audited Manager Overrides:** Floor managers can grant discretionary overrides capped at 10% (1000 bps). Overrides require an authorizing manager's `staff_id` (verified against `can_override_discount: true` in `staff.json`) and a mandatory reason code (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`). Shared PINs are completely prohibited.
 
 ### C. Payment Safety & Distributed Reconciliation
 - **Two-Phase Commit Pattern:** A local transaction intent is recorded with a generated invoice number before contacting the payment gateway. The charge request sends `order_ref = invoice_no` as an idempotency key.

@@ -14,7 +14,13 @@ from eluno_pos.cli.formatting import (
     prompt_confirm,
     prompt_input,
 )
-from eluno_pos.domain.cart import Cart, CartLine, ManagerOverride
+from eluno_pos.domain.cart import (
+    Cart,
+    CartLine,
+    ManagerOverride,
+    VALID_OVERRIDE_REASONS,
+    normalize_override_reason,
+)
 from eluno_pos.domain.invoice import InvoiceStatus, get_financial_year
 from eluno_pos.domain.lens import LensVariant
 from eluno_pos.domain.money import parse_to_paise
@@ -418,8 +424,18 @@ def run_checkout(
             print(f"✖ Error: Discretionary manager discount cannot exceed 10% (got {manager_override_bps / 100:.2f}%).")
             return 1
 
+        if not override_reason or not override_reason.strip():
+            allowed = ", ".join(sorted(VALID_OVERRIDE_REASONS))
+            print(f"✖ Error: Missing required '--override-reason' for manager discount override. Valid reason codes: {allowed}")
+            return 1
+
+        normalized_reason = normalize_override_reason(override_reason)
+        if normalized_reason not in VALID_OVERRIDE_REASONS:
+            allowed = ", ".join(sorted(VALID_OVERRIDE_REASONS))
+            print(f"✖ Error: Invalid override reason '{override_reason.strip()}'. Valid reason codes: {allowed}")
+            return 1
+
         approver_id = override_manager_id or staff_member["staff_id"]
-        reason = override_reason or "CUSTOMER_RETENTION"
 
         # Check permissions: operating staff or authorizing manager associated with this store
         approver = next((s for s in staff_list if s["staff_id"] == approver_id and s.get("can_override_discount")), None)
@@ -437,11 +453,11 @@ def run_checkout(
         override = ManagerOverride(
             staff_id=approver["staff_id"],
             role=approver["role"],
-            reason_code=reason,
+            reason_code=normalized_reason,
             discount_percent_bps=manager_override_bps,
         )
         cart.manager_override = override
-        print(f"✔ Manager Override Approved: {manager_override_bps / 100:.2f}% authorized by {approver['staff_id']} [Reason: {reason}].")
+        print(f"✔ Manager Override Approved: {manager_override_bps / 100:.2f}% authorized by {approver['staff_id']} [Reason: {normalized_reason}].")
 
     # =========================================================================
     # Step 10 & 11: Evaluate Offers, Compute GST & Prepare Session (Dynamic Financial Year)

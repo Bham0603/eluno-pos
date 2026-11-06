@@ -1,6 +1,8 @@
 """Unit and functional tests for Eluno POS CLI commands, parsing, and formatting."""
 
 from datetime import date
+from typing import Optional
+import uuid
 import io
 import os
 import sys
@@ -96,6 +98,14 @@ class TestCli(unittest.TestCase):
         self.assertEqual(args.staff, "S108")
         self.assertEqual(args.customer, "+919000000001")
         self.assertTrue(args.auto_confirm)
+
+        # Checkout with manager override and reason
+        args_ov = parser.parse_args([
+            "checkout", "-s", "HSR", "--staff", "S108", "-c", "+919000000001",
+            "--manager-override", "500", "--override-reason", "PRICE_MATCH", "-y",
+        ])
+        self.assertEqual(args_ov.manager_override_bps, 500)
+        self.assertEqual(args_ov.override_reason, "PRICE_MATCH")
 
         # Refund
         args = parser.parse_args(["refund", "-i", "ELU/HSR/FY26/00001", "-y"])
@@ -1041,6 +1051,175 @@ class TestCli(unittest.TestCase):
         self.assertIn("SKIPPED (Local SQLite ledger only)", output)
         self.assertIn("Reconciliation Notice:", output)
         self.assertIn("Shopify reconciliation skipped; figures are based on the local SQLite ledger.", output)
+
+
+    def _run_checkout_helper(
+        self,
+        manager_override_bps: Optional[int] = None,
+        override_reason: Optional[str] = None,
+        override_manager_id: Optional[str] = None,
+    ):
+        fake_cust = _make_customer()
+        locations = [{"id": 70000002, "name": "Eluno HSR Layout", "active": True, "eluno": {"store_code": "HSR", "kind": "store"}}]
+        staff_hsr = [{"staff_id": "S108", "name": "Meera", "role": "store_manager", "store_code": "HSR", "can_override_discount": True}]
+        frame_dict = {"id": 91000001, "sku": "FR-0001", "title": "Test Frame", "price": "10000.00", "eluno": {"hsn": "90031900"}}
+        lens_dict = {"id": 91000041, "sku": "LN-0001", "title": "Test Lens", "price": "1000.00", "eluno": {"hsn": "90015000"}}
+
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), \
+             patch.object(self.ctx.shopify_client, "get_locations", return_value=locations), \
+             patch.object(self.ctx.smt_client, "get_staff", return_value=staff_hsr), \
+             patch.object(self.ctx.customer_service, "find_by_phone", return_value=fake_cust), \
+             patch.object(self.ctx.prescription_service, "get_prescriptions_by_phone", return_value=[]), \
+             patch.object(self.ctx.shopify_client, "get_variant", side_effect=lambda vid: frame_dict if vid == 91000001 else lens_dict), \
+             patch.object(self.ctx.terminal_client, "create_charge", side_effect=lambda *a, **k: {"status": "captured", "charge_id": f"ch_mock_{uuid.uuid4().hex}"}) as mock_charge, \
+             patch.object(self.ctx.shopify_client, "create_order", side_effect=lambda *a, **k: {"id": 77000000 + int(uuid.uuid4().hex[:6], 16), "order_number": 1099, "financial_status": "paid"}) as mock_order:
+
+            ret = run_checkout(
+                ctx=self.ctx,
+                store_code="HSR",
+                staff_id="S108",
+                customer_phone="+919000000001",
+                frame_variant_id=91000001,
+                lens_variant_id=91000041,
+                manager_override_bps=manager_override_bps,
+                override_reason=override_reason,
+                override_manager_id=override_manager_id,
+                auto_confirm=True,
+            )
+            return ret, captured.getvalue(), mock_charge, mock_order
+
+    def test_manager_override_missing_reason_rejected(self) -> None:
+        """When manager_override_bps > 0, missing override_reason must be rejected without silent fallback."""
+        ret, output, mock_charge, mock_order = self._run_checkout_helper(
+            manager_override_bps=500,
+            override_reason=None,
+        )
+        self.assertEqual(ret, 1)
+        self.assertIn("Missing required '--override-reason'", output)
+        self.assertNotIn("[Reason: CUSTOMER_RETENTION]", output)
+        self.assertNotIn("Manager Override Approved", output)
+        mock_charge.assert_not_called()
+        mock_order.assert_not_called()
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_manager_override_empty_and_whitespace_reason_rejected(self) -> None:
+        """Empty and whitespace-only override reasons must be rejected."""
+        for empty_val in ["", "   ", "\t\n  "]:
+            ret, output, mock_charge, mock_order = self._run_checkout_helper(
+                manager_override_bps=300,
+                override_reason=empty_val,
+            )
+            self.assertEqual(ret, 1)
+            self.assertIn("Missing required '--override-reason'", output)
+            mock_charge.assert_not_called()
+            mock_order.assert_not_called()
+
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_manager_override_invalid_reason_rejected(self) -> None:
+        """Unsupported reason codes must be rejected with an explicit error and allowed list."""
+        for invalid_code in ["INVALID_CODE", "FRIEND_DISCOUNT", "PROMO_MATCH", "UNSUPPORTED"]:
+            ret, output, mock_charge, mock_order = self._run_checkout_helper(
+                manager_override_bps=500,
+                override_reason=invalid_code,
+            )
+            self.assertEqual(ret, 1)
+            self.assertIn(f"Invalid override reason '{invalid_code}'", output)
+            self.assertIn("Valid reason codes:", output)
+            mock_charge.assert_not_called()
+            mock_order.assert_not_called()
+
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_manager_override_valid_reason_codes(self) -> None:
+        """All four canonical reason codes (CUSTOMER_RETENTION, PRICE_MATCH, WALKOUT_RESCUE, DAMAGE_ALLOWANCE) are accepted."""
+        from eluno_pos.domain.cart import VALID_OVERRIDE_REASONS
+        self.assertEqual(
+            VALID_OVERRIDE_REASONS,
+            {"CUSTOMER_RETENTION", "PRICE_MATCH", "WALKOUT_RESCUE", "DAMAGE_ALLOWANCE"}
+        )
+
+        for code in sorted(VALID_OVERRIDE_REASONS):
+            ret, output, mock_charge, mock_order = self._run_checkout_helper(
+                manager_override_bps=500,
+                override_reason=code,
+            )
+            self.assertEqual(ret, 0, f"Expected success for reason '{code}'")
+            self.assertIn(f"Manager Override Approved: 5.00% authorized by S108 [Reason: {code}]", output)
+            mock_charge.assert_called_once()
+            mock_order.assert_called_once()
+
+    def test_manager_override_whitespace_and_case_normalization(self) -> None:
+        """Override reasons with leading/trailing whitespace or lower/mixed case are normalized."""
+        test_cases = [
+            ("  price_match  ", "PRICE_MATCH"),
+            ("customer_retention", "CUSTOMER_RETENTION"),
+            ("  walkout_rescue ", "WALKOUT_RESCUE"),
+            ("Damage_Allowance", "DAMAGE_ALLOWANCE"),
+        ]
+        for raw_val, expected_norm in test_cases:
+            ret, output, mock_charge, mock_order = self._run_checkout_helper(
+                manager_override_bps=500,
+                override_reason=raw_val,
+            )
+            self.assertEqual(ret, 0, f"Expected success for '{raw_val}'")
+            self.assertIn(f"Reason: {expected_norm}", output)
+            mock_charge.assert_called_once()
+            mock_order.assert_called_once()
+
+    def test_normal_checkout_without_manager_override(self) -> None:
+        """When manager_override_bps is None or 0, checkout proceeds normally without an override reason."""
+        # 1. manager_override_bps is None
+        ret_none, out_none, charge_none, order_none = self._run_checkout_helper(
+            manager_override_bps=None,
+            override_reason=None,
+        )
+        self.assertEqual(ret_none, 0)
+        self.assertNotIn("Manager Discretionary Discount Override", out_none)
+        charge_none.assert_called_once()
+        order_none.assert_called_once()
+
+        # 2. manager_override_bps is 0
+        ret_zero, out_zero, charge_zero, order_zero = self._run_checkout_helper(
+            manager_override_bps=0,
+            override_reason=None,
+        )
+        self.assertEqual(ret_zero, 0)
+        self.assertNotIn("Manager Discretionary Discount Override", out_zero)
+        charge_zero.assert_called_once()
+        order_zero.assert_called_once()
+
+    def test_no_financial_mutation_when_override_reason_rejected(self) -> None:
+        """Financial safety invariant: A rejected override reason creates no invoice, payment, or order."""
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            invoices_before = cur.fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM invoice_sequences;")
+            seq_before = cur.fetchone()[0]
+
+        ret, output, mock_charge, mock_order = self._run_checkout_helper(
+            manager_override_bps=750,
+            override_reason="BOGUS_REASON",
+        )
+        self.assertEqual(ret, 1)
+        mock_charge.assert_not_called()
+        mock_order.assert_not_called()
+
+        with self.ctx.repo._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM invoices;")
+            invoices_after = cur.fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM invoice_sequences;")
+            seq_after = cur.fetchone()[0]
+
+        self.assertEqual(invoices_before, invoices_after, "No invoice records must be created")
+        self.assertEqual(seq_before, seq_after, "No invoice sequence rows must be allocated")
 
 
 if __name__ == "__main__":

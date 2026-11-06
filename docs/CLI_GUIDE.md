@@ -170,7 +170,7 @@ python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 -
 - `--for-member`: Recipient name for family billing (persisted as `wearer_name`).
 - `--for-customer-id`, `--wearer-id`: Persisted integer customer ID of wearer/recipient (kept `None` if unenrolled).
 - `--manager-override`: Manager discount override in basis points (100 bps = 1.00%, max 1000 bps = 10.00%).
-- `--override-reason`: Mandatory reason code for manager override (e.g. `CUSTOMER_RETENTION`, `PRICE_MATCH`).
+- `--override-reason`: Mandatory reason code for manager override (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`).
 - `--override-manager-id`: Staff ID of authorizing store manager (must have `store_manager` override permissions).
 - `--method`, `-m`: Payment method (`upi`, `card`, `cash`). Default: `upi`.
 - `--yes`, `-y`: Run non-interactively. Requires complete, explicit transaction inputs (`--store`, `--staff`, `--customer`, `--frame`, `--lens`); no silent demo defaults are assumed for financial safety, and authorizes the financial operation without interactive confirmation.
@@ -184,7 +184,7 @@ python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 -
 6. **Authoritative HSN Source**: Enforces HSN lookup strictly from `variant.eluno.hsn`. Rejects variants missing documented HSN metadata before invoice allocation.
 7. **Optical Validation (`LensValidator`)**: Checks SPH, CYL, AXIS, and ADD limits against lens geometry.
 8. **Pair Association**: Binds frame and lens under a deterministic `pair_ref` token and persists wearer association.
-9. **Manager Override**: Validates authorized store manager role, audit reason code, and enforces strict 10% cap.
+9. **Manager Override**: Validates authorized store manager role, mandatory audit reason code (`CUSTOMER_RETENTION`, `PRICE_MATCH`, `WALKOUT_RESCUE`, `DAMAGE_ALLOWANCE`), and enforces strict 10% cap.
 10. **Promotion Evaluation (`OfferService`)**: Evaluates best savings across product, category, pair, and cart levels.
 11. **Tax Engine (`GstService`)**: Computes exact CGST + SGST per HSN (`90031900` @ 18%, `90015000` @ 5%) with zero paisa drift.
 12. **Dynamic Financial Year**: Derives invoice financial year dynamically from transaction date using Indian convention (April 1 – March 31, e.g. `FY27` for November 2026).

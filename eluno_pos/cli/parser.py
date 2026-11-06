@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkout_p.add_argument("--for-member", help="Individual recipient name for family billing.")
     checkout_p.add_argument("--for-customer-id", "--wearer-id", type=int, dest="for_customer_id", help="Persisted customer ID of wearer/recipient.")
     checkout_p.add_argument("--manager-override", type=int, dest="manager_override_bps", help="Manager discount override in basis points (e.g. 500 for 5%%).")
-    checkout_p.add_argument("--override-reason", help="Mandatory audit reason code for manager discount.")
+    checkout_p.add_argument("--override-reason", help="Mandatory audit reason code for manager discount (CUSTOMER_RETENTION, PRICE_MATCH, WALKOUT_RESCUE, DAMAGE_ALLOWANCE).")
     checkout_p.add_argument("--override-manager-id", help="Staff ID of authorizing store manager.")
     checkout_p.add_argument("-m", "--method", default="upi", choices=["upi", "card", "cash"], help="Payment method (default: upi).")
     checkout_p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Run non-interactively with explicit required arguments, bypassing interactive confirmation prompts.")

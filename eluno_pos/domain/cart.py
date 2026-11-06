@@ -51,6 +51,28 @@ class CartLine:
         return max(0, self.gross_price_paise - self.total_discount_paise)
 
 
+VALID_OVERRIDE_REASONS = frozenset({
+    "CUSTOMER_RETENTION",
+    "PRICE_MATCH",
+    "WALKOUT_RESCUE",
+    "DAMAGE_ALLOWANCE",
+})
+
+
+def normalize_override_reason(reason: Optional[str]) -> Optional[str]:
+    """Normalize manager discount override reason (strip whitespace and uppercase)."""
+    if reason is None:
+        return None
+    cleaned = reason.strip().upper()
+    return cleaned if cleaned else None
+
+
+def is_valid_override_reason(reason: Optional[str]) -> bool:
+    """Check if the given reason is non-empty and in the canonical allowlist."""
+    normalized = normalize_override_reason(reason)
+    return normalized in VALID_OVERRIDE_REASONS
+
+
 @dataclass
 class ManagerOverride:
     """Staff manager discretionary discount authorization."""
