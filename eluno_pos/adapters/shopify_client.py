@@ -83,24 +83,86 @@ class ShopifyClient:
         self,
         created_at_min: Optional[str] = None,
         created_at_max: Optional[str] = None,
+        updated_at_min: Optional[str] = None,
+        updated_at_max: Optional[str] = None,
         location_id: Optional[int] = None,
         status: str = "any",
         financial_status: Optional[str] = None,
-        limit: int = 50,
+        limit: int = 250,
     ) -> List[Dict[str, Any]]:
-        """List orders with optional filtering by date range, store, and status."""
+        """List orders with optional filtering by date range, store, and status.
+
+        Implements cursor pagination: follows Link rel="next" headers until exhausted.
+        If any page beyond the first fails, raises an error rather than returning partial results.
+        Detects and raises on pagination loops or runaway pagination (>200 pages).
+        """
+        import re
+
         params: Dict[str, Any] = {"status": status, "limit": limit}
         if created_at_min:
             params["created_at_min"] = created_at_min
         if created_at_max:
             params["created_at_max"] = created_at_max
+        if updated_at_min:
+            params["updated_at_min"] = updated_at_min
+        if updated_at_max:
+            params["updated_at_max"] = updated_at_max
         if location_id is not None:
             params["location_id"] = location_id
         if financial_status:
             params["financial_status"] = financial_status
 
+        _MAX_PAGES = 200
+        all_orders: List[Dict[str, Any]] = []
+        seen_cursor_urls: set = set()
+        pages_fetched = 0
+
+        # First page — use the initial params
         resp = self.http.get("orders.json", params=params)
-        return resp.data.get("orders", [])
+        all_orders.extend(resp.data.get("orders", []))
+        pages_fetched += 1
+
+        def _extract_next_url(headers: Dict[str, str]) -> Optional[str]:
+            """Case-insensitively parse the Link header and return the rel='next' URL."""
+            link_header = None
+            for key, val in headers.items():
+                if key.lower() == "link":
+                    link_header = val
+                    break
+            if not link_header:
+                return None
+            # Each entry: <url>; rel="next" or <url>; rel="previous"
+            for part in link_header.split(","):
+                part = part.strip()
+                m = re.match(r'<([^>]+)>\s*;\s*rel=["\']?next["\']?', part, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+            return None
+
+        next_url = _extract_next_url(resp.headers)
+
+        while next_url is not None:
+            if next_url in seen_cursor_urls:
+                raise RuntimeError(
+                    f"Shopify pagination loop detected: cursor URL appeared twice. "
+                    f"Refusing to return potentially incomplete results. URL: {next_url}"
+                )
+            seen_cursor_urls.add(next_url)
+
+            if pages_fetched >= _MAX_PAGES:
+                raise RuntimeError(
+                    f"Shopify pagination safety limit reached ({_MAX_PAGES} pages). "
+                    f"Refusing to return potentially incomplete results. "
+                    f"Check date filters or Shopify order volume."
+                )
+
+            # Pass the cursor URL directly as the path; no additional params
+            resp = self.http.get(next_url)
+            all_orders.extend(resp.data.get("orders", []))
+            pages_fetched += 1
+            next_url = _extract_next_url(resp.headers)
+
+        return all_orders
 
     def get_order(self, order_id: int) -> Dict[str, Any]:
         """Fetch a single order by ID."""

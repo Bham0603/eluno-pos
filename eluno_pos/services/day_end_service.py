@@ -100,22 +100,69 @@ class DayEndReportService:
         location_id: int,
         business_date: str,
     ) -> List[Dict[str, Any]]:
-        """Fetch Shopify orders for the given location, ensuring historical refunded orders are included."""
+        """Fetch Shopify orders for the given location and IST business date.
+
+        Two queries are performed:
+        1. created_at window: orders created on the requested IST business day.
+        2. updated_at window: orders updated on the requested IST business day (to discover
+           old orders that received a refund today).
+
+        Results are merged by Shopify order ID to avoid duplicates.
+        The existing SQLite completed-refund reference lookup supplements as a recovery mechanism.
+        """
         assert self.shopify_client is not None
-        orders = self.shopify_client.get_orders(
+
+        # Build IST business-day boundaries as ISO-8601 strings with +05:30 offset
+        try:
+            from datetime import date as _date
+            parsed = _date.fromisoformat(business_date)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid business_date format '{business_date}': expected YYYY-MM-DD") from exc
+
+        day_start = datetime(parsed.year, parsed.month, parsed.day, 0, 0, 0, tzinfo=IST)
+        day_end   = datetime(parsed.year, parsed.month, parsed.day, 23, 59, 59, tzinfo=IST)
+
+        # Format as ISO-8601 with explicit +05:30 offset (Shopify REST accepts this)
+        def _fmt(dt: datetime) -> str:
+            return dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
+        ist_min = _fmt(day_start)
+        ist_max = _fmt(day_end)
+
+        order_dict: Dict[int, Dict[str, Any]] = {}
+
+        # Query 1: orders CREATED on the requested IST business day
+        created_orders = self.shopify_client.get_orders(
+            created_at_min=ist_min,
+            created_at_max=ist_max,
             location_id=location_id,
             status="any",
             limit=250,
         )
-        order_dict: Dict[int, Dict[str, Any]] = {}
-        for o in orders:
+        for o in created_orders:
             if "id" in o:
                 try:
                     order_dict[int(o["id"])] = o
                 except (ValueError, TypeError):
                     pass
 
-        # Check if local SQLite has completed refunds for this store referencing an order not in order_dict
+        # Query 2: orders UPDATED on the requested IST business day
+        # This discovers old orders that were refunded today.
+        updated_orders = self.shopify_client.get_orders(
+            updated_at_min=ist_min,
+            updated_at_max=ist_max,
+            location_id=location_id,
+            status="any",
+            limit=250,
+        )
+        for o in updated_orders:
+            if "id" in o:
+                try:
+                    order_dict[int(o["id"])] = o
+                except (ValueError, TypeError):
+                    pass
+
+        # SQLite recovery supplement: look for completed refunds referencing orders not yet in order_dict
         try:
             with self.repo._get_connection() as conn:
                 cur = conn.execute(

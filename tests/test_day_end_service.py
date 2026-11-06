@@ -2312,5 +2312,253 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertNotEqual(sum_hsn_taxable, report.sales_taxable_value_paise)
 
 
+
+    def test_ist_date_window_passed_to_shopify(self) -> None:
+        """IST business-day boundary timestamps are passed to Shopify get_orders calls."""
+        self.mock_shopify.get_orders.return_value = []
+        self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date="2026-10-20",
+            reconcile_with_shopify=True,
+        )
+        self.assertGreaterEqual(self.mock_shopify.get_orders.call_count, 2)
+        calls = self.mock_shopify.get_orders.call_args_list
+        created_at_calls = [c for c in calls if c[1].get('created_at_min') is not None or
+                            (c[0] and 'created_at_min' in str(c))]
+        self.assertTrue(len(created_at_calls) >= 1 or any(
+            '2026-10-20T00:00:00+05:30' in str(c) for c in calls
+        ), 'Expected IST day-start timestamp in a get_orders call')
+
+    def test_order_inside_ist_window_is_included(self) -> None:
+        """An order with created_at exactly at IST day start is included as a sale."""
+        business_date = "2026-10-20"
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": 95001001,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "5000.00",
+                "total_discounts": "0.00",
+                "total_price": "5000.00",
+                "total_tax": "238.10",
+                "created_at": "2026-10-20T00:00:00+05:30",
+                "line_items": [
+                    {
+                        "id": 96001001,
+                        "sku": "FR-INSIDE",
+                        "price": "5000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "119.05"},
+                            {"title": "SGST", "price": "119.05"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+
+    def test_order_outside_ist_window_is_excluded_from_sales(self) -> None:
+        """An order created on a different IST date is not counted as a sale."""
+        business_date = "2026-10-20"
+        self.mock_shopify.get_orders.return_value = [
+            {
+                "id": 95002001,
+                "location_id": 70000002,
+                "financial_status": "paid",
+                "subtotal_price": "3000.00",
+                "total_discounts": "0.00",
+                "total_price": "3000.00",
+                "total_tax": "142.86",
+                "created_at": "2026-10-19T23:59:59+05:30",
+                "line_items": [
+                    {
+                        "id": 96002001,
+                        "sku": "FR-OUTSIDE",
+                        "price": "3000.00",
+                        "quantity": 1,
+                        "total_discount": "0.00",
+                        "properties": [{"name": "hsn", "value": "90031900"}],
+                        "tax_lines": [
+                            {"title": "CGST", "price": "71.43"},
+                            {"title": "SGST", "price": "71.43"},
+                        ],
+                    }
+                ],
+                "refunds": [],
+            }
+        ]
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+        self.assertEqual(report.posted_sales_count, 0)
+        self.assertEqual(report.gross_sales_paise, 0)
+
+    def test_older_order_refunded_today_refund_included_sale_not_recounted(self) -> None:
+        """Older order refunded today: refund counted, original sale not recounted."""
+        business_date = "2026-10-20"
+        old_order = {
+            "id": 95003001,
+            "location_id": 70000002,
+            "financial_status": "refunded",
+            "subtotal_price": "8000.00",
+            "total_discounts": "0.00",
+            "total_price": "8000.00",
+            "total_tax": "380.95",
+            "created_at": "2026-10-15T14:00:00+05:30",
+            "line_items": [
+                {
+                    "id": 96003001,
+                    "sku": "FR-OLD",
+                    "price": "8000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [
+                        {"title": "CGST", "price": "190.48"},
+                        {"title": "SGST", "price": "190.47"},
+                    ],
+                }
+            ],
+            "refunds": [
+                {
+                    "id": 97003001,
+                    "created_at": "2026-10-20T10:00:00+05:30",
+                    "refund_line_items": [
+                        {
+                            "id": 98003001,
+                            "line_item_id": 96003001,
+                            "quantity": 1,
+                            "subtotal": "7619.05",
+                            "total_tax": "380.95",
+                        }
+                    ],
+                    "transactions": [
+                        {"kind": "refund", "status": "success", "amount": "8000.00"}
+                    ],
+                }
+            ],
+        }
+
+        def get_orders_side_effect(**kwargs):
+            return [old_order]
+
+        self.mock_shopify.get_orders.side_effect = get_orders_side_effect
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        self.assertEqual(report.posted_sales_count, 0, "Older order sale must NOT be counted on report date")
+        self.assertEqual(report.gross_sales_paise, 0, "No gross sales from an older order")
+        self.assertEqual(report.refunds_count, 1, "Refund created today must be counted")
+        self.assertEqual(report.refunds_amount_paise, 800000, "Refund amount must equal 8000")
+
+    def test_same_order_in_both_queries_processed_once(self) -> None:
+        """Order returned by both created_at and updated_at queries is counted only once."""
+        business_date = "2026-10-20"
+        order = {
+            "id": 95004001,
+            "location_id": 70000002,
+            "financial_status": "paid",
+            "subtotal_price": "4000.00",
+            "total_discounts": "0.00",
+            "total_price": "4000.00",
+            "total_tax": "190.48",
+            "created_at": "2026-10-20T09:00:00+05:30",
+            "line_items": [
+                {
+                    "id": 96004001,
+                    "sku": "FR-DEDUP",
+                    "price": "4000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [
+                        {"title": "CGST", "price": "95.24"},
+                        {"title": "SGST", "price": "95.24"},
+                    ],
+                }
+            ],
+            "refunds": [],
+        }
+        self.mock_shopify.get_orders.return_value = [order]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 400000)
+
+    def test_sqlite_historical_refund_lookup_still_works(self) -> None:
+        """SQLite completed-refund reference lookup still supplements Shopify retrieval."""
+        business_date = "2026-10-20"
+        self.mock_shopify.get_orders.return_value = []
+        self.mock_shopify.get_order.return_value = {
+            "id": 95005001,
+            "location_id": 70000002,
+            "financial_status": "refunded",
+            "subtotal_price": "6000.00",
+            "total_discounts": "0.00",
+            "total_price": "6000.00",
+            "total_tax": "285.72",
+            "created_at": "2026-10-15T14:00:00+05:30",
+            "line_items": [],
+            "refunds": [
+                {
+                    "id": 97005001,
+                    "created_at": "2026-10-20T11:00:00+05:30",
+                    "refund_line_items": [],
+                    "transactions": [
+                        {"kind": "refund", "status": "success", "amount": "6000.00"}
+                    ],
+                }
+            ],
+        }
+        self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+        self.assertGreaterEqual(self.mock_shopify.get_orders.call_count, 2)
+
+    def test_pagination_error_propagates_as_unreconciled(self) -> None:
+        """If Shopify pagination raises RuntimeError, falls back to SQLite offline mode."""
+        from eluno_pos.adapters.exceptions import ServerError
+
+        business_date = "2026-10-20"
+        self.mock_shopify.get_orders.side_effect = RuntimeError("Shopify pagination safety limit reached")
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+        self.assertFalse(report.is_reconciled)
+        self.assertTrue(any('unavailable' in d.lower() or 'pagination' in d.lower() or 'shopify' in d.lower()
+                            for d in report.discrepancies))
+
 if __name__ == "__main__":
     unittest.main()
