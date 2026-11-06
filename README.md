@@ -503,5 +503,6 @@ Eluno POS is currently engineered and validated as a technical assessment protot
 
 - **[CLI User Guide & Operational Manual](docs/CLI_GUIDE.md):** Complete operational reference detailing all CLI commands, lifecycle invariants, evaluator walkthroughs, and error recovery protocols.
 - **[Stakeholder Scoped Plan & Clarifications](STAKEHOLDER_REPLY.md):** Formal pre-engineering memorandum addressing stakeholder requirements, risk mitigations, scope boundaries, and architectural trade-offs.
+- **[Loom Video Recording Outline](docs/LOOM_OUTLINE.md):** 8-minute Loom walkthrough recording script, segment breakdown, and demo cues mapped to docs/DEMO_WALKTHROUGH.log.
 - **[Starter-Kit Seed Data & Schemas](starter-kit/schema.md):** Detailed field definitions for products, lens matrices, customer cohorts, and tax rates.
 

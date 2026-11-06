@@ -1,0 +1,317 @@
+# ========================================================================
+# ELUNO POS — FRESH CLI VERIFICATION & DEMONSTRATION LOG
+# Executed on 2026-11-07 (Asia/Kolkata) with fresh DB and deterministic mock server
+# ========================================================================
+
+# ------------------------------------------------------------------------
+# 1. DOCTOR: Pre-flight system and dependency verification
+# Command: python -m eluno_pos doctor
+# ------------------------------------------------------------------------
+
+========================================================================
+  ELUNO POS — SYSTEM PRE-FLIGHT DIAGNOSTICS (DOCTOR)
+  Diagnostic verification of external dependencies and environment
+========================================================================
+
+[1/5] Checking environment configuration...
+  ✔ Environment variables loaded from .env
+  ✔ Environment: VALID (Store: HSR | Staff: S108 | FY: FY27)
+
+[2/5] Checking SQLite local database...
+  ✔ Local database accessible and migrations applied: C:\Users\bham0\OneDrive\Desktop\eluno-pos-exercise-v1.2 (1)\eluno-pos-exercise\eluno_pos.db
+  ✔ Write-Ahead Logging (WAL) and foreign keys verified.
+  ✔ Database Health: HEALTHY
+
+[3/5] Checking Shopify API reachability...
+  ✔ Shopify API endpoint reachable at http://localhost:8787/admin/api/2026-10
+  ✔ Active store locations verified: 2 locations found.
+  ✔ Shopify Reachability: ONLINE
+
+[4/5] Checking SMT Central API reachability...
+  ✔ SMT Central API reachable at http://localhost:8787/smt
+  ✔ Staff directory accessible: 4 active staff members.
+  ✔ SMT Reachability: ONLINE
+
+[5/5] Checking Payment Terminal Gateway reachability...
+  ✔ Payment Gateway reachable at http://localhost:8787/terminal
+  ✔ Terminal gateway status: ONLINE
+
+========================================================================
+✔ PRE-FLIGHT CHECK COMPLETE: 5/5 diagnostics passed. System ready for POS transactions!
+========================================================================
+(Exit code: 0)
+
+
+# ------------------------------------------------------------------------
+# 2. CUSTOMER LOOKUP: Demographic profile & clinical history with data minimization
+# Command: python -m eluno_pos customer lookup --phone +919000000001
+# ------------------------------------------------------------------------
+
+========================================================================
+  ELUNO POS — CUSTOMER PROFILE & CLINICAL HISTORY
+  Clinical Data Minimization Protocol Active
+========================================================================
+
+Searching customer directory for '+919000000001'...
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Customer Demographic Record                                     │
+├──────────────────────────────────────────────────────────────────┤
+│  Shopify Customer ID: 80001001                                   │
+│  Full Name: Rahul Menon                                          │
+│  Phone: +919000000001                                            │
+│  Email: rahul.menon@example.com                                  │
+│  Home Store: VC                                                  │
+│  Tags: family                                                    │
+└──────────────────────────────────────────────────────────────────┘
+
+--- Active Clinical Prescriptions (SMT Central) ---
+Rx ID  | Wearer Name     | Exam Date  | Clinic / Optometrist | Sph (R/L)   | Cyl (R/L)   | Axis (R/L) | Add (R/L)  | Status
+-------+-----------------+------------+----------------------+-------------+-------------+------------+------------+-------
+RX5002 | Self (#80001001)| 2026-10-15 | Eluno Vision Care    | [PROTECTED] | [PROTECTED] | [PROTECT.] | [PROTECT.] | VALID 
+RX5003 | Self (#80001001)| 2026-08-20 | Eluno Vision Care    | [PROTECTED] | [PROTECTED] | [PROTECT.] | [PROTECT.] | VALID 
+
+Note: Clinical powers (SPH/CYL/AXIS) are minimized during lookup and
+validated deterministically against laboratory tolerances during lens pairing.
+(Exit code: 0)
+
+
+# ------------------------------------------------------------------------
+# 3. COMPLETE CHECKOUT: Full optical pairing, offers, payment & cloud sync
+# Command: python -m eluno_pos checkout --store HSR --staff S108 --customer +919000000001 --frame 91000001 --lens 91000041 --yes
+# ------------------------------------------------------------------------
+
+========================================================================
+  ELUNO POS — CLINICAL CHECKOUT & DISPATCH WORKFLOW
+  Optical Pairing, Offer Resolution & Multi-Phase Settlement
+========================================================================
+
+[1/15] Validating staff credentials...
+  ✔ Staff S108 (Meera P.) authorized at store HSR.
+
+[2/15] Verifying customer profile...
+  ✔ Customer: Rahul Menon (+919000000001) [ID: 80001001]
+
+[3/15] Validating prescription...
+  ✔ Prescription RX5002 verified for wearer 'Self (#80001001)'.
+
+[4/15] Validating optical catalog items & physical stock...
+  ✔ Frame 91000001 (Olive) verified. Stock available: 1 at HSR.
+  ✔ Lens 91000041 (standard) verified. Custom ophthalmic blank.
+
+[5/15] Validating prescription optical constraints against lens matrix...
+  ✔ Lens optical matrix validation passed for RX5002.
+
+[6/15] Checking manager override authorization...
+  ✔ Standard checkout without manager override.
+
+[7/15] Evaluating automated and coupon offers...
+  ✔ Best offer resolved: FESTIVE10 (Flat 10% Off on frames)
+
+[8/15] Constructing optical pairs and calculating exact GST...
+  ✔ Optical pair constructed: Frame (FR-0001) + Lens (LN-0001).
+  ✔ Cart subtotals:
+     Gross Total: ₹13,997.00
+     Discounts: -₹1,299.80
+     Net Payable: ₹12,697.20 (GST incl.: ₹1,832.04)
+
+[9/15] Allocating sequential store tax invoice number...
+  ✔ Invoice allocated: ELU/HSR/FY27/00001
+
+[10/15] Initiating card/UPI payment terminal transaction...
+  ✔ Terminal transaction initiated with order_ref: ELU/HSR/FY27/00001
+  ✔ Terminal payment captured. Charge ID: chg_99000001
+
+[11/15] Submitting confirmed order to Shopify Cloud...
+  ✔ Shopify order created. ID: 99000005 | Order Number: 1013
+
+[12/15] Posting store tax invoice to local database...
+  ✔ Invoice ELU/HSR/FY27/00001 status transitioned to POSTED.
+
+[13/15] Generating GST-compliant thermal sales receipt...
+  ✔ Receipt rendered with HSN codes 90031900 (18%) and 90015000 (5%).
+
+[14/15] Dispatching laboratory manufacturing order...
+  ✔ Optical lab dispatch confirmed for pair: Frame 91000001 + Lens 91000041.
+
+[15/15] Finalizing transaction lifecycle...
+  ✔ Transaction lifecycle complete. Zero pending reconciliations.
+
+========================================================================
+✔ CHECKOUT SUCCESSFUL!
+  Invoice Number: ELU/HSR/FY27/00001
+  Payment Reference: chg_99000001
+  Shopify Order: #1013 (ID: 99000005)
+  Final Amount Paid: ₹12,697.20
+========================================================================
+(Exit code: 0)
+
+
+# ------------------------------------------------------------------------
+# 4. INVOICE SHOW: Inspect posted store tax invoice
+# Command: python -m eluno_pos invoice show --invoice ELU/HSR/FY27/00001
+# ------------------------------------------------------------------------
+
+========================================================================
+  STORE TAX INVOICE INSPECTION
+  Official Legal Sales Record: ELU/HSR/FY27/00001
+========================================================================
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Tax Invoice Metadata                                           │
+├──────────────────────────────────────────────────────────────────┤
+│  Invoice Number: ELU/HSR/FY27/00001                              │
+│  Store Code: HSR                                                 │
+│  Financial Year: FY27                                            │
+│  Document Status: POSTED                                         │
+│  Date Issued: 2026-11-06 19:47:50                                │
+│  Customer ID: 80001001                                           │
+│  Terminal Charge ID: chg_99000001                                │
+│  Shopify Order ID: 99000005                                      │
+└──────────────────────────────────────────────────────────────────┘
+
+--- Itemized Invoice Lines ---
+SKU / Title      | Type  | HSN      | Qty | Gross      | Discount  | Net        | Taxable   | CGST    | SGST    | Total GST | Pair / Rx                                           
+-----------------+-------+----------+-----+------------+-----------+------------+-----------+---------+---------+-----------+-----------------------------------------------------
+FR-0001
+Olive    | frame | 90031900 | 1   | ₹12,998.00 | ₹1,299.80 | ₹11,698.20 | ₹9,913.73 | ₹892.24 | ₹892.23 | ₹1,784.47 | Pair: pair_1 (Rx: RX5002) [Wearer: Self (#80001001)]
+LN-0001
+standard | lens  | 90015000 | 1   | ₹999.00    | ₹0.00     | ₹999.00    | ₹951.43   | ₹23.79  | ₹23.78  | ₹47.57    | Pair: pair_1 (Rx: RX5002) [Wearer: Self (#80001001)]
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Invoice Financial & Tax Breakdown                              │
+├──────────────────────────────────────────────────────────────────┤
+│  Gross Revenue: ₹13,997.00                                       │
+│  Total Discounts Given: -₹1,299.80                               │
+│  Taxable Base Amount: ₹10,865.16                                 │
+│  CGST (Central Tax): ₹916.03                                     │
+│  SGST (State Tax): ₹916.01                                       │
+│  Total GST (Exact Paisa): ₹1,832.04                              │
+│  FINAL INVOICE TOTAL: ₹12,697.20                                 │
+└──────────────────────────────────────────────────────────────────┘
+(Exit code: 0)
+
+
+# ------------------------------------------------------------------------
+# 5. FULL REFUND: Payment reversal, credit note, frame restock, lens scrapped
+# Command: python -m eluno_pos refund --invoice ELU/HSR/FY27/00001 --staff S108 --reason CUSTOMER_RETURN --yes
+# ------------------------------------------------------------------------
+
+========================================================================
+  ELUNO POS — STORE RETURN & FULL REFUND WORKFLOW
+  Payment Reversal, Credit Note & Frame Restock
+========================================================================
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Original Sale Details                                          │
+├──────────────────────────────────────────────────────────────────┤
+│  Invoice Number: ELU/HSR/FY27/00001                              │
+│  Store Code: HSR                                                 │
+│  Original Sale Date: 2026-11-06                                  │
+│  Original Gross: ₹13,997.00                                      │
+│  Discounts Given: ₹1,299.80                                      │
+│  Net Amount Paid: ₹12,697.20                                     │
+│  Terminal Charge ID: chg_99000001                                │
+│  Shopify Order ID: 99000005                                      │
+│  Refundable Balance: ₹12,697.20                                  │
+└──────────────────────────────────────────────────────────────────┘
+✔ Restocking Target: Location ID 70000002 (HSR)
+✔ Authorizing Staff Verified: Meera P. (store_manager) [ID: S108]
+
+Refund Summary: Reversing ₹12,697.20 to customer's original payment method.
+
+Processing terminal reversal and cloud inventory reconciliation...
+
+✔ FULL REFUND COMPLETED SUCCESSFULLY!
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Credit Note & Reversal Summary                                 │
+├──────────────────────────────────────────────────────────────────┤
+│  Credit Note Number: ELU/HSR/FY27/CN/00001                       │
+│  Original Invoice: ELU/HSR/FY27/00001                            │
+│  Refund Status: COMPLETED                                        │
+│  Amount Refunded: ₹12,697.20                                     │
+│  Terminal Refund ID: trf_99000006                                │
+│  Shopify Refund ID: 99000008                                     │
+│  Frame Restock: RESTOCKED (+1 unit at location 70000002)         │
+│  Lens Restock: NO_RESTOCK (Custom ophthalmic medical device ...  │
+│  Reason Code: CUSTOMER_RETURN                                    │
+│  Authorizing Staff: S108                                         │
+└──────────────────────────────────────────────────────────────────┘
+
+Thermal credit note printed. Hand copy to customer.
+(Exit code: 0)
+
+
+# ------------------------------------------------------------------------
+# 6. DAY-END REPORT: Multi-system sales, tax & refund aggregation
+# Command: python -m eluno_pos report --store HSR --date 2026-11-07
+# ------------------------------------------------------------------------
+
+========================================================================
+  ELUNO POS — DAY-END STORE FINANCIAL REPORT
+  Multi-System Sales, Tax & Refund Aggregation
+========================================================================
+
+Generating Day-End Report for Store 'HSR' on 2026-11-07 (Asia/Kolkata)...
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Day-End Financial & Tax Summary                                │
+├──────────────────────────────────────────────────────────────────┤
+│  Store Code / Loc ID: HSR / 70000002                             │
+│  Business Date: 2026-11-07 (Asia/Kolkata)                        │
+│  Gross Sales Bills: 1 bills                                      │
+│  Gross Sales Revenue: ₹13,997.00                                 │
+│  Total Discounts Given: -₹1,299.80                               │
+│  Net Sales (Gross - Disc): ₹12,697.20                            │
+│  Completed Refunds: 1 credit note(s)                             │
+│  Total Refund Amount: -₹12,697.20                                │
+│  NET STORE REVENUE: ₹0.00                                        │
+│  Sales Taxable Value: ₹10,865.16                                 │
+│  Refund Taxable Reversal: ₹10,865.16                             │
+│  NET TAXABLE VALUE: ₹0.00                                        │
+│  Net CGST (Central): ₹0.00                                       │
+│  Net SGST (State): ₹0.00                                         │
+│  NET TOTAL GST PAYABLE: ₹0.00                                    │
+└──────────────────────────────────────────────────────────────────┘
+
+--- Payment Method Breakdown ---
+Payment Gateway / Method | Amount Collected
+-------------------------+-----------------
+UPI                      | ₹12,697.20      
+
+--- Sales Channel Breakdown ---
+Sales Channel | Amount    
+--------------+-----------
+walk_in       | ₹12,697.20
+
+--- GST Tax Breakdown by HSN Code ---
+HSN Code | Gross Taxable | Gross GST | Refund Taxable | Refund GST | Net Taxable | Net GST
+---------+---------------+-----------+----------------+------------+-------------+--------
+90015000 | ₹951.43       | ₹47.57    | ₹951.43        | ₹47.57     | ₹0.00       | ₹0.00  
+90031900 | ₹9,913.73     | ₹1,784.47 | ₹9,913.73      | ₹1,784.47  | ₹0.00       | ₹0.00  
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Operational Audit & Cloud Synchronization                      │
+├──────────────────────────────────────────────────────────────────┤
+│  Cancelled Invoices: 0 (Pre-payment abandoned)                   │
+│  Pending Reconciliations: 0 items                                │
+│  Shopify Cloud Sync: RECONCILED (100% matched)                   │
+└──────────────────────────────────────────────────────────────────┘
+✔ Day-end report successfully generated.
+(Exit code: 0)
+
+
+# ------------------------------------------------------------------------
+# 7. RECONCILE HUB: Transaction reconciliation and in-flight inspection
+# Command: python -m eluno_pos reconcile --store HSR
+# ------------------------------------------------------------------------
+
+========================================================================
+  ELUNO POS — TRANSACTION & RECONCILIATION HUB
+  Inspecting In-Flight and Ambiguous Operations
+========================================================================
+
+✔ ZERO PENDING TRANSACTIONS: All invoices, payments, and refunds are 100% reconciled.
+(Exit code: 0)
+

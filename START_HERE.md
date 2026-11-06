@@ -10,6 +10,7 @@ This implementation replaces the till billing interface of Shopify POS, connecti
 
 - **[`README.md`](README.md):** Primary architectural overview, complete Must/Should/Stretch scope declaration matrix, detailed design decisions, and system specifications.
 - **[`docs/CLI_GUIDE.md`](docs/CLI_GUIDE.md):** Complete operator manual and CLI reference covering all 7 commands, options, safety invariants, and a 5-minute evaluator walkthrough.
+- **[docs/LOOM_OUTLINE.md](docs/LOOM_OUTLINE.md):** 8-minute Loom walkthrough recording script, segment breakdown, and demo cues mapped to docs/DEMO_WALKTHROUGH.log.
 - **[`STAKEHOLDER_REPLY.md`](STAKEHOLDER_REPLY.md):** Part A formal pre-engineering memorandum answering stakeholder questions, scoping trade-offs, and production launch dependencies.
 - **[`brief/CANDIDATE_BRIEF.md`](brief/CANDIDATE_BRIEF.md):** Original exercise brief defining Must, Should, and Stretch requirements.
 - **[`starter-kit/schema.md`](starter-kit/schema.md):** Data schemas for products, lens matrices, customer cohorts, and tax rates.
