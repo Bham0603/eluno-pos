@@ -2324,11 +2324,10 @@ class TestDayEndReportService(unittest.TestCase):
         )
         self.assertGreaterEqual(self.mock_shopify.get_orders.call_count, 2)
         calls = self.mock_shopify.get_orders.call_args_list
-        created_at_calls = [c for c in calls if c[1].get('created_at_min') is not None or
-                            (c[0] and 'created_at_min' in str(c))]
-        self.assertTrue(len(created_at_calls) >= 1 or any(
-            '2026-10-20T00:00:00+05:30' in str(c) for c in calls
-        ), 'Expected IST day-start timestamp in a get_orders call')
+        created_at_calls = [c for c in calls if c[1].get('created_at_min') is not None]
+        self.assertTrue(len(created_at_calls) >= 1)
+        self.assertEqual(created_at_calls[0][1]['created_at_min'], '2026-10-20T00:00:00+05:30')
+        self.assertEqual(created_at_calls[0][1]['created_at_max'], '2026-10-21T00:00:00+05:30')
 
     def test_order_inside_ist_window_is_included(self) -> None:
         """An order with created_at exactly at IST day start is included as a sale."""
@@ -2559,6 +2558,79 @@ class TestDayEndReportService(unittest.TestCase):
         self.assertFalse(report.is_reconciled)
         self.assertTrue(any('unavailable' in d.lower() or 'pagination' in d.lower() or 'shopify' in d.lower()
                             for d in report.discrepancies))
+
+    def test_fractional_second_boundary_and_following_day_exclusion(self) -> None:
+        """Requirement: Include fractional seconds at end of IST day (23:59:59.500+05:30)
+        and exclude the first instant of the following day (00:00:00+05:30).
+        """
+        business_date = "2026-10-20"
+        order_late = {
+            "id": 95006001,
+            "location_id": 70000002,
+            "financial_status": "paid",
+            "subtotal_price": "5000.00",
+            "total_discounts": "0.00",
+            "total_price": "5000.00",
+            "total_tax": "238.10",
+            "created_at": "2026-10-20T23:59:59.500+05:30",  # Fractional second at end of day
+            "line_items": [
+                {
+                    "id": 96006001,
+                    "sku": "FR-LATE",
+                    "price": "5000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [
+                        {"title": "CGST", "price": "119.05"},
+                        {"title": "SGST", "price": "119.05"},
+                    ],
+                }
+            ],
+            "refunds": [],
+        }
+        order_next_day = {
+            "id": 95006002,
+            "location_id": 70000002,
+            "financial_status": "paid",
+            "subtotal_price": "4000.00",
+            "total_discounts": "0.00",
+            "total_price": "4000.00",
+            "total_tax": "190.48",
+            "created_at": "2026-10-21T00:00:00+05:30",  # First instant of following day
+            "line_items": [
+                {
+                    "id": 96006002,
+                    "sku": "FR-NEXT-DAY",
+                    "price": "4000.00",
+                    "quantity": 1,
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [
+                        {"title": "CGST", "price": "95.24"},
+                        {"title": "SGST", "price": "95.24"},
+                    ],
+                }
+            ],
+            "refunds": [],
+        }
+
+        # Mock Shopify returning both orders because created_at_max is 2026-10-21T00:00:00+05:30
+        self.mock_shopify.get_orders.return_value = [order_late, order_next_day]
+
+        report = self.service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=business_date,
+            reconcile_with_shopify=True,
+        )
+
+        # Order at 23:59:59.500+05:30 must be counted
+        # Order at 2026-10-21T00:00:00+05:30 must NOT be counted
+        self.assertEqual(report.posted_sales_count, 1)
+        self.assertEqual(report.gross_sales_paise, 500000)
+        self.assertEqual(report.sales_total_gst_paise, 23810)
+
 
 if __name__ == "__main__":
     unittest.main()

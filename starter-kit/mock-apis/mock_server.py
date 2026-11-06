@@ -53,6 +53,19 @@ def now(): return datetime.now(timezone.utc).astimezone().isoformat(timespec="se
 def paise(s): return int(round(float(s) * 100))
 def money(p): return f"{'-' if p < 0 else ''}{abs(p) // 100}.{abs(p) % 100:02d}"
 
+def parse_dt(s):
+    if not s: return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+for o in S["orders"].values():
+    o.setdefault("updated_at", o.get("created_at") or now())
+
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body, extra=None):
         b = json.dumps(body).encode(); self.send_response(code)
@@ -99,12 +112,39 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"inventory_levels": rows})
         if r == "orders.json":
             os_ = list(S["orders"].values())
-            if q.get("status", "open") != "any": os_ = [o for o in os_ if o.get("cancelled_at") is None]
-            for k in ("created_at_min", "created_at_max"):
-                if q.get(k): os_ = [o for o in os_ if (o["created_at"] >= q[k]) == (k == "created_at_min") or o["created_at"] == q[k]]
-            if q.get("location_id"): os_ = [o for o in os_ if o["location_id"] == int(q["location_id"])]
-            if q.get("financial_status"): os_ = [o for o in os_ if o["financial_status"] == q["financial_status"]]
-            return self._send(200, {"orders": sorted(os_, key=lambda o: o["created_at"])[: int(q.get("limit", 50))]})
+            st = q.get("status", "open")
+            if st != "any":
+                os_ = [o for o in os_ if o.get("cancelled_at") is None]
+            if q.get("location_id"):
+                try:
+                    loc_id = int(q["location_id"])
+                    os_ = [o for o in os_ if o.get("location_id") == loc_id]
+                except (ValueError, TypeError):
+                    pass
+            if q.get("financial_status"):
+                os_ = [o for o in os_ if o.get("financial_status") == q["financial_status"]]
+
+            # Timestamp-aware date filtering
+            if q.get("created_at_min"):
+                dt_min = parse_dt(q["created_at_min"])
+                if dt_min is not None:
+                    os_ = [o for o in os_ if parse_dt(o.get("created_at")) and parse_dt(o.get("created_at")) >= dt_min]
+            if q.get("created_at_max"):
+                dt_max = parse_dt(q["created_at_max"])
+                if dt_max is not None:
+                    os_ = [o for o in os_ if parse_dt(o.get("created_at")) and parse_dt(o.get("created_at")) <= dt_max]
+            if q.get("updated_at_min"):
+                dt_min = parse_dt(q["updated_at_min"])
+                if dt_min is not None:
+                    os_ = [o for o in os_ if parse_dt(o.get("updated_at")) and parse_dt(o.get("updated_at")) >= dt_min]
+            if q.get("updated_at_max"):
+                dt_max = parse_dt(q["updated_at_max"])
+                if dt_max is not None:
+                    os_ = [o for o in os_ if parse_dt(o.get("updated_at")) and parse_dt(o.get("updated_at")) <= dt_max]
+
+            limit_val = int(q.get("limit", 50))
+            sorted_orders = sorted(os_, key=lambda o: parse_dt(o.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc))
+            return self._send(200, {"orders": sorted_orders[:limit_val]})
         m = re.match(r"orders/(\d+)\.json$", r)
         if m: o = S["orders"].get(int(m.group(1))); return self._send(200, {"order": o}) if o else self._err(404, "Not Found")
         self._err(404, "Not Found")
@@ -168,7 +208,9 @@ class H(BaseHTTPRequestHandler):
                     if ib == "decrement_obeying_policy" and row["available"] < li["quantity"]: return self._err(422, {"line_items": [f"{v['sku']}: only {row['available']} available at location {o['location_id']}"]})
                     row["available"] -= li["quantity"]; row["updated_at"] = now()
             S["seq"]["order"] += 1; num = S["seq"]["order"]
-            order = {"id": nid(), "order_number": num, "name": f"#{num}", "created_at": now(), "processed_at": now(),
+            c_at = o.get("created_at") or now()
+            u_at = o.get("updated_at") or c_at
+            order = {"id": nid(), "order_number": num, "name": f"#{num}", "created_at": c_at, "updated_at": u_at, "processed_at": c_at,
                      "location_id": o.get("location_id"), "source_name": o.get("source_name", "api"), "customer": o.get("customer"),
                      "currency": "INR", "taxes_included": True, "financial_status": "paid" if paid >= total else ("partially_paid" if paid else "pending"),
                      "fulfillment_status": None, "subtotal_price": money(sub), "total_discounts": money(disc), "total_tax": money(tax),
@@ -184,6 +226,7 @@ class H(BaseHTTPRequestHandler):
             t.update({"id": nid(), "status": t.get("status", "success"), "created_at": now(), "currency": "INR"}); o["transactions"].append(t)
             paid = sum(paise(x["amount"]) for x in o["transactions"] if x["kind"] == "sale" and x["status"] == "success")
             o["financial_status"] = "paid" if paid >= paise(o["total_price"]) else "partially_paid"
+            o["updated_at"] = now()
             return self._send(201, {"transaction": t})
         m = re.match(r"orders/(\d+)/refunds(/calculate)?\.json$", r)
         if m:
@@ -227,6 +270,7 @@ class H(BaseHTTPRequestHandler):
             refund = {"id": nid(), "order_id": o["id"], "created_at": now(), "note": rf.get("note"), "refund_line_items": out, "transactions": txs, "note_attributes": rf.get("note_attributes", [])}
             o["refunds"].append(refund)
             o["financial_status"] = "refunded" if refunded + rsum >= captured and captured else "partially_refunded"
+            o["updated_at"] = now()
             return self._send(201, {"refund": refund})
         self._err(404, "Not Found")
 

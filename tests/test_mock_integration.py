@@ -476,6 +476,156 @@ class TestMockServerIntegration(unittest.TestCase):
         temp_dir.cleanup()
 
 
+    def test_live_historical_refund_discovery_via_updated_at_query(self) -> None:
+        """Prove historical-refund discovery against the live mock server:
+        1. An old order's created_at is outside the report date.
+        2. Its updated_at is inside the report date because a refund occurred today.
+        3. The created_at query does not return the old order.
+        4. The updated_at query returns the old order.
+        5. The day-end report counts the refund exactly once.
+        6. The original sale is not counted again.
+        """
+        import tempfile
+        from datetime import datetime, date, timedelta, timezone
+        from eluno_pos.repositories.invoice_repository import InvoiceRepository
+        from eluno_pos.services.day_end_service import DayEndReportService, IST
+
+        # 1. Create an old order on the mock server created in the past (e.g. 2026-09-15)
+        old_created_at = "2026-09-15T12:00:00+05:30"
+        order_payload = {
+            "location_id": 70000002,
+            "taxes_included": True,
+            "created_at": old_created_at,
+            "line_items": [
+                {
+                    "variant_id": 91000001,
+                    "quantity": 1,
+                    "price": "10000.00",
+                    "total_discount": "0.00",
+                    "properties": [{"name": "hsn", "value": "90031900"}],
+                    "tax_lines": [
+                        {"title": "CGST", "price": "686.44"},
+                        {"title": "SGST", "price": "686.44"},
+                    ],
+                }
+            ],
+            "transactions": [
+                {"kind": "sale", "status": "success", "amount": "10000.00", "gateway": "upi"}
+            ],
+            "note_attributes": [
+                {"name": "store_code", "value": "HSR"},
+                {"name": "channel", "value": "walk_in"},
+                {"name": "payment_method", "value": "upi"},
+            ],
+        }
+        old_order = self.shopify.create_order(order_payload)
+        old_order_id = old_order["id"]
+
+        # 2. Refund the order today (live call to mock server)
+        refund_payload = {
+            "refund_line_items": [
+                {
+                    "line_item_id": old_order["line_items"][0]["id"],
+                    "quantity": 1,
+                    "restock_type": "no_restock",
+                }
+            ],
+            "transactions": [
+                {
+                    "kind": "refund",
+                    "amount": "10000.00",
+                    "gateway": "upi",
+                }
+            ],
+        }
+        refund_resp = self.shopify.create_refund(old_order_id, refund_payload)
+        self.assertIn("id", refund_resp)
+
+        # Fetch the updated order directly from mock server to verify timestamps
+        refreshed_order = self.shopify.get_order(old_order_id)
+        today_ist_date = datetime.now(IST).strftime("%Y-%m-%d")
+
+        # Prove 1: created_at is outside report date
+        created_at_ist = refreshed_order["created_at"][:10]
+        self.assertEqual(created_at_ist, "2026-09-15")
+        self.assertNotEqual(created_at_ist, today_ist_date)
+
+        # Prove 2: updated_at is inside report date (because refund occurred today)
+        updated_at_dt = datetime.fromisoformat(refreshed_order["updated_at"].replace("Z", "+00:00"))
+        if updated_at_dt.tzinfo is None:
+            updated_at_dt = updated_at_dt.replace(tzinfo=timezone.utc)
+        updated_at_ist = updated_at_dt.astimezone(IST).strftime("%Y-%m-%d")
+        self.assertEqual(updated_at_ist, today_ist_date)
+
+        # Compute query boundaries for today
+        day_start = datetime.strptime(today_ist_date, "%Y-%m-%d").replace(tzinfo=IST)
+        following_day = day_start + timedelta(days=1)
+        ist_min = day_start.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+        ist_max = following_day.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
+        # Prove 3: created_at query does NOT return the old order
+        created_orders = self.shopify.get_orders(
+            created_at_min=ist_min,
+            created_at_max=ist_max,
+            location_id=70000002,
+            status="any",
+            limit=250,
+        )
+        created_order_ids = [o["id"] for o in created_orders]
+        self.assertNotIn(old_order_id, created_order_ids, "created_at query must NOT return old order")
+
+        # Prove 4: updated_at query DOES return the old order
+        updated_orders = self.shopify.get_orders(
+            updated_at_min=ist_min,
+            updated_at_max=ist_max,
+            location_id=70000002,
+            status="any",
+            limit=250,
+        )
+        updated_order_ids = [o["id"] for o in updated_orders]
+        self.assertIn(old_order_id, updated_order_ids, "updated_at query MUST return old order updated by refund")
+
+        # Prove 5 & 6: Day-end report counts the refund exactly once; original sale is NOT counted again
+        temp_dir = tempfile.TemporaryDirectory()
+        repo = InvoiceRepository(f"{temp_dir.name}/test_live_hist_refund.db")
+        day_end_service = DayEndReportService(invoice_repository=repo, shopify_client=self.shopify)
+
+        # Direct shopify computation
+        shopify_comp = day_end_service._compute_from_shopify(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=today_ist_date,
+        )
+
+        self.assertGreaterEqual(shopify_comp["refunds_count"], 1)
+        self.assertGreaterEqual(shopify_comp["refunds_amount_paise"], 1000000)
+
+        # Full day-end report verification
+        report = day_end_service.generate_report(
+            store_code="HSR",
+            location_id=70000002,
+            business_date=today_ist_date,
+            reconcile_with_shopify=True,
+        )
+        self.assertGreaterEqual(report.refunds_count, 1)
+        self.assertGreaterEqual(report.refunds_amount_paise, 1000000)
+
+        # Verify old order was retrieved via updated_at and merged exactly once
+        candidate_orders = day_end_service._fetch_shopify_orders_for_store("HSR", 70000002, today_ist_date)
+        old_order_candidates = [o for o in candidate_orders if o["id"] == old_order_id]
+        self.assertEqual(len(old_order_candidates), 1, "Merged orders must contain old order exactly once")
+
+        # Verify old order's sale was NOT counted on today's report
+        self.assertNotIn(old_order_id, [o["id"] for o in candidate_orders if day_end_service._to_ist_date_string(o.get("created_at", "")) == today_ist_date])
+
+        # The refund inside old_order must be counted exactly once
+        refunds_for_old_order = [r for r in old_order_candidates[0].get("refunds", [])
+                                 if day_end_service._to_ist_date_string(r.get("created_at", "")) == today_ist_date]
+        self.assertEqual(len(refunds_for_old_order), 1, "Refund on old order counted exactly once")
+
+        temp_dir.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
 

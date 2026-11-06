@@ -120,14 +120,14 @@ class DayEndReportService:
             raise ValueError(f"Invalid business_date format '{business_date}': expected YYYY-MM-DD") from exc
 
         day_start = datetime(parsed.year, parsed.month, parsed.day, 0, 0, 0, tzinfo=IST)
-        day_end   = datetime(parsed.year, parsed.month, parsed.day, 23, 59, 59, tzinfo=IST)
+        following_day_start = day_start + timedelta(days=1)
 
         # Format as ISO-8601 with explicit +05:30 offset (Shopify REST accepts this)
         def _fmt(dt: datetime) -> str:
             return dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
         ist_min = _fmt(day_start)
-        ist_max = _fmt(day_end)
+        ist_max = _fmt(following_day_start)
 
         order_dict: Dict[int, Dict[str, Any]] = {}
 
