@@ -626,6 +626,114 @@ class TestMockServerIntegration(unittest.TestCase):
         temp_dir.cleanup()
 
 
+    def test_live_shopify_order_status_filtering_all_values_and_rejection(self) -> None:
+        """Accurate Shopify order status filtering and rejection against live mock server.
+
+        Verifies:
+        1. status=any: returns all orders (including cancelled/archived).
+        2. status=open: returns orders that are not closed or cancelled.
+        3. status=closed: returns closed, non-cancelled orders.
+        4. status=cancelled: returns cancelled orders.
+        5. Unsupported status values (e.g. 'invalid', 'pending', 'foo') are rejected with HTTP 400.
+        6. Default status when omitted in direct HTTP request is 'open'.
+        """
+        from eluno_pos.adapters.exceptions import ApiClientError
+
+        # 1. Reject unsupported status values with HTTP 400
+        for bad_status in ["invalid_status", "pending", "archived", "draft"]:
+            with self.assertRaises(ApiClientError) as ctx:
+                self.shopify.get_orders(status=bad_status)
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("Invalid status", str(ctx.exception.response_body))
+
+        # Direct HTTP check for unsupported status
+        bad_resp = None
+        try:
+            self.shopify_http.get("orders.json", params={"status": "bogus"})
+        except ApiClientError as e:
+            bad_resp = e
+        self.assertIsNotNone(bad_resp)
+        self.assertEqual(bad_resp.status_code, 400)
+
+        # 2. Setup known orders for status lifecycle testing:
+        # Order 95000003 remains open (closed_at=None, cancelled_at=None)
+        # Order 95000001 is closed (closed_at set, cancelled_at=None)
+        # Order 95000002 is cancelled (cancelled_at set, closed_at=None)
+        # Order 95000004 is both closed and cancelled (closed_at set, cancelled_at set)
+        try:
+            # Close order 95000001
+            resp_close = self.shopify_http.post("orders/95000001/close.json")
+            self.assertEqual(resp_close.status_code, 200)
+            self.assertIsNotNone(resp_close.data["order"].get("closed_at"))
+            self.assertIsNone(resp_close.data["order"].get("cancelled_at"))
+
+            # Cancel order 95000002
+            resp_cancel = self.shopify_http.post("orders/95000002/cancel.json")
+            self.assertEqual(resp_cancel.status_code, 200)
+            self.assertIsNotNone(resp_cancel.data["order"].get("cancelled_at"))
+            self.assertIsNone(resp_cancel.data["order"].get("closed_at"))
+
+            # Set order 95000004 to both closed and cancelled
+            self.shopify_http.post("orders/95000004/close.json")
+            resp_both = self.shopify_http.post("orders/95000004/cancel.json")
+            self.assertEqual(resp_both.status_code, 200)
+            self.assertIsNotNone(resp_both.data["order"].get("closed_at"))
+            self.assertIsNotNone(resp_both.data["order"].get("cancelled_at"))
+
+            # A. Test status=open: returns orders that are not closed or cancelled
+            open_orders = self.shopify.get_orders(status="open")
+            open_ids = {o["id"] for o in open_orders}
+            self.assertIn(95000003, open_ids)
+            self.assertNotIn(95000001, open_ids, "closed order must not appear in status=open")
+            self.assertNotIn(95000002, open_ids, "cancelled order must not appear in status=open")
+            self.assertNotIn(95000004, open_ids, "closed+cancelled order must not appear in status=open")
+            for o in open_orders:
+                self.assertFalse(bool(o.get("closed_at")), f"Order {o['id']} in open results has closed_at set")
+                self.assertFalse(bool(o.get("cancelled_at")), f"Order {o['id']} in open results has cancelled_at set")
+
+            # B. Test status=closed: returns closed, non-cancelled orders
+            closed_orders = self.shopify.get_orders(status="closed")
+            closed_ids = {o["id"] for o in closed_orders}
+            self.assertIn(95000001, closed_ids, "closed non-cancelled order must appear in status=closed")
+            self.assertNotIn(95000003, closed_ids, "open order must not appear in status=closed")
+            self.assertNotIn(95000002, closed_ids, "cancelled order must not appear in status=closed")
+            self.assertNotIn(95000004, closed_ids, "closed+cancelled order must not appear in status=closed")
+            for o in closed_orders:
+                self.assertTrue(bool(o.get("closed_at")), f"Order {o['id']} in closed results missing closed_at")
+                self.assertFalse(bool(o.get("cancelled_at")), f"Order {o['id']} in closed results has cancelled_at set")
+
+            # C. Test status=cancelled: returns cancelled orders (even if closed_at is also set)
+            cancelled_orders = self.shopify.get_orders(status="cancelled")
+            cancelled_ids = {o["id"] for o in cancelled_orders}
+            self.assertIn(95000002, cancelled_ids, "cancelled order must appear in status=cancelled")
+            self.assertIn(95000004, cancelled_ids, "closed+cancelled order must appear in status=cancelled")
+            self.assertNotIn(95000003, cancelled_ids, "open order must not appear in status=cancelled")
+            self.assertNotIn(95000001, cancelled_ids, "closed non-cancelled order must not appear in status=cancelled")
+            for o in cancelled_orders:
+                self.assertTrue(bool(o.get("cancelled_at")), f"Order {o['id']} in cancelled results missing cancelled_at")
+
+            # D. Test status=any: returns all orders, including cancelled/archived
+            any_orders = self.shopify.get_orders(status="any")
+            any_ids = {o["id"] for o in any_orders}
+            self.assertIn(95000001, any_ids, "closed order must appear in status=any")
+            self.assertIn(95000002, any_ids, "cancelled order must appear in status=any")
+            self.assertIn(95000003, any_ids, "open order must appear in status=any")
+            self.assertIn(95000004, any_ids, "closed+cancelled order must appear in status=any")
+            # Verify exact partition union: len(open) + len(closed) + len(cancelled) == len(any)
+            self.assertEqual(len(open_orders) + len(closed_orders) + len(cancelled_orders), len(any_orders))
+
+            # E. Default when status is omitted in raw GET orders.json must be 'open'
+            raw_default_resp = self.shopify_http.get("orders.json")
+            raw_open_ids = {o["id"] for o in raw_default_resp.data.get("orders", [])}
+            self.assertEqual(raw_open_ids, open_ids)
+
+        finally:
+            # Restore all mutated orders to open status
+            self.shopify_http.post("orders/95000001/open.json")
+            self.shopify_http.post("orders/95000002/open.json")
+            self.shopify_http.post("orders/95000004/open.json")
+
+
 if __name__ == "__main__":
     unittest.main()
 

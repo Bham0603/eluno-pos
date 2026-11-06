@@ -245,6 +245,18 @@ class TestShopifyClient(unittest.TestCase):
         self.assertNotIn("created_at_max", call_params)
 
 
+    def test_get_orders_status_param_passed_correctly(self) -> None:
+        """status param is passed through to query params."""
+        self.mock_http.get.return_value = HttpResponse(
+            status_code=200,
+            data={"orders": []},
+            headers={},
+        )
+        self.client.get_orders(status="closed")
+        call_params = self.mock_http.get.call_args[1]["params"]
+        self.assertEqual(call_params["status"], "closed")
+
+
 if __name__ == "__main__":
     unittest.main()
 

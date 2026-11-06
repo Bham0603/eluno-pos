@@ -65,6 +65,8 @@ def parse_dt(s):
 
 for o in S["orders"].values():
     o.setdefault("updated_at", o.get("created_at") or now())
+    o.setdefault("cancelled_at", None)
+    o.setdefault("closed_at", None)
 
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body, extra=None):
@@ -111,10 +113,19 @@ class H(BaseHTTPRequestHandler):
             rows = [v for (i, l), v in S["inventory"].items() if (not ids or i in ids) and (not locs or l in locs)]
             return self._send(200, {"inventory_levels": rows})
         if r == "orders.json":
-            os_ = list(S["orders"].values())
             st = q.get("status", "open")
-            if st != "any":
-                os_ = [o for o in os_ if o.get("cancelled_at") is None]
+            valid_statuses = {"any", "open", "closed", "cancelled"}
+            if st not in valid_statuses:
+                return self._err(400, f"Invalid status '{st}': must be one of 'open', 'closed', 'cancelled', 'any'")
+            os_ = list(S["orders"].values())
+            if st == "open":
+                os_ = [o for o in os_ if not o.get("closed_at") and not o.get("cancelled_at")]
+            elif st == "closed":
+                os_ = [o for o in os_ if o.get("closed_at") and not o.get("cancelled_at")]
+            elif st == "cancelled":
+                os_ = [o for o in os_ if o.get("cancelled_at")]
+            elif st == "any":
+                pass
             if q.get("location_id"):
                 try:
                     loc_id = int(q["location_id"])
@@ -216,8 +227,17 @@ class H(BaseHTTPRequestHandler):
                      "fulfillment_status": None, "subtotal_price": money(sub), "total_discounts": money(disc), "total_tax": money(tax),
                      "total_price": money(total), "total_line_items_price": money(sub), "tags": o.get("tags", ""), "note": o.get("note"),
                      "note_attributes": o.get("note_attributes", []), "discount_applications": o.get("discount_applications", []),
-                     "line_items": lis, "transactions": txs, "refunds": [], "cancelled_at": None}
+                     "line_items": lis, "transactions": txs, "refunds": [], "cancelled_at": o.get("cancelled_at"), "closed_at": o.get("closed_at")}
             S["orders"][order["id"]] = order; return self._send(201, {"order": order})
+        m = re.match(r"orders/(\d+)/(close|cancel|open)\.json$", r)
+        if m:
+            oid = int(m.group(1)); act = m.group(2); o = S["orders"].get(oid)
+            if not o: return self._err(404, "Not Found")
+            if act == "close": o["closed_at"] = now()
+            elif act == "cancel": o["cancelled_at"] = now()
+            elif act == "open": o["closed_at"] = None; o["cancelled_at"] = None
+            o["updated_at"] = now()
+            return self._send(200, {"order": o})
         m = re.match(r"orders/(\d+)/transactions\.json$", r)
         if m:
             o = S["orders"].get(int(m.group(1))); t = b.get("transaction")
